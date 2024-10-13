@@ -45,10 +45,6 @@ class MistralFlexAttention(MistralAttention):
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
         assert self.attention_dropout == 0 # flex attention does not directly support dropout yet
 
         # In PEFT, usually we cast the layer norms in float32 for training stability reasons
@@ -75,7 +71,7 @@ class MistralFlexAttention(MistralAttention):
         assert attention_mask.shape == (bsz, 1, q_len, q_len) or attention_mask.shape == (1, 1, q_len, q_len), f"got attention_mask of shape {attention_mask.shape}, expected {(bsz, 1, q_len, q_len)} or {(1, 1, q_len, q_len)}"
 
         attn_output = self.flex_attention_compiled(
-            query_states, key_states, value_states, block_mask=attention_mask
+            query_states, key_states, value_states, block_mask=attention_mask, enable_gqa=True
         ).transpose(1, 2)
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim).contiguous()
