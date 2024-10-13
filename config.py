@@ -181,6 +181,7 @@ class DPOConfig(TrainingArguments):
     enable_packing: bool = False
     max_train_samples: Optional[int] = None
     max_eval_samples: Optional[int] = None
+    packing_length: Optional[int] = None
 
     def __post_init__(self):
         if self.max_target_length is not None:

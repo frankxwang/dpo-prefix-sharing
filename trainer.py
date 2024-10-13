@@ -22,6 +22,7 @@ from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.amp as amp
 import torch.nn as nn
@@ -50,7 +51,6 @@ from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalLoopOutput
 from transformers.utils import is_peft_available
 from transformers.utils.deprecation import deprecate_kwarg
-
 from trl.models.modeling_base import PreTrainedModelWrapper, create_reference_model
 from trl.trainer.callbacks import SyncRefModelCallback
 from trl.trainer.utils import (
@@ -73,6 +73,9 @@ from benchmark.utils import CudaTimer
 from config import DPOConfig, FDivergenceConstants, FDivergenceType
 from modeling.llama_patches import LlamaForCausalLMFlexAttn 
 from modeling.mistral_patches import MistralForCausalLMFlexAttn
+from data.packing import MultipackBatchSampler
+from data.patch_datasets import patch_torch_to_work_with_hf
+from torch.utils.data import RandomSampler
 
 if is_peft_available():
     from peft import PeftModel, get_peft_model, prepare_model_for_kbit_training
@@ -122,8 +125,35 @@ if is_deepspeed_available():
                 #     range(prompt_len - 1, prompt_len + rejected_len)
                 # )
 
+def _maybe_process_batch_for_prefix_sharing(batch, idx: int, chosen_tokens, rejected_tokens, args):
+    if args.prefix_sharing:
+        for k in ['input_ids', 'attention_mask']:
+            batch[k] = [chosen_tokens[i][f"prompt_{k}"] + chosen_tokens[i][k] + chosen_tokens[i][f"prompt_{k}"][-1:] + rejected_tokens[i][k] for i in range(len(chosen_tokens))]
+        prompt_lens = [len(chosen_row["prompt_input_ids"]) for chosen_row in chosen_tokens]
+        chosen_lens = [len(chosen_row["input_ids"]) for chosen_row in chosen_tokens]
+        rejected_lens = [len(rejected_row["input_ids"]) for rejected_row in rejected_tokens]
+        batch["labels"] = [ [] for _ in chosen_tokens]
+        for i, chosen_row in enumerate(chosen_tokens):
+            batch["labels"][i] = [args.label_pad_token_id] * prompt_lens[i] + chosen_row["input_ids"] + [args.label_pad_token_id] + rejected_tokens[i]["input_ids"]
+
+        batch["length"] = [len(tokens) for tokens in batch["input_ids"]]
+        batch["position_ids"] = [list(range(prompt_len + chosen_len)) + list(range(prompt_len - 1, prompt_len + rejected_len)) for prompt_len, chosen_len, rejected_len in zip(prompt_lens, chosen_lens, rejected_lens)]
+
+        if args.enable_packing:
+            batch["sequence_id"] = [[idx for _ in range(length)] for length in batch["length"]]
+            batch["chosen_index"] = [[prompt_len - 1 for _ in range(length)] for prompt_len, length in zip(prompt_lens, batch["length"])]
+            batch["rejected_index"] = [[prompt_len + chosen_len for _ in range(length)]for prompt_len, chosen_len, length in zip(prompt_lens, chosen_lens, batch["length"])]
+            batch["end_index"] =[[prompt_len + chosen_len + rejected_len + 1 for _ in range(length)] for prompt_len, chosen_len, rejected_len, length in zip(prompt_lens, chosen_lens, rejected_lens, batch["length"])]
+        else:
+            batch["chosen_index"] = [prompt_len - 1 for prompt_len in prompt_lens]
+            batch["rejected_index"] = [prompt_len + chosen_len for prompt_len, chosen_len in zip(prompt_lens, chosen_lens)]
+            batch["end_index"] = [prompt_len + chosen_len + rejected_len + 1 for prompt_len, chosen_len, rejected_len in zip(prompt_lens, chosen_lens, rejected_lens)]
+
+    return batch
+
 def _tokenize(
     features: Dict[str, List],
+    idx: int,
     tokenizer: PreTrainedTokenizerBase,
     args: DPOConfig,
     processor: Optional[Callable] = None,
@@ -155,21 +185,7 @@ def _tokenize(
 
         _append_prompt_tokens_to_batch(batch, prompt_tokens)
 
-        if args.prefix_sharing:
-            for k in ['input_ids', 'attention_mask']:
-                batch[k] = [chosen_tokens[i][f"prompt_{k}"] + chosen_tokens[i][k] + chosen_tokens[i][f"prompt_{k}"][-1:] + rejected_tokens[i][k] for i in range(len(chosen_tokens))]
-            prompt_lens = [len(chosen_row["prompt_input_ids"]) for chosen_row in chosen_tokens]
-            chosen_lens = [len(chosen_row["input_ids"]) for chosen_row in chosen_tokens]
-            rejected_lens = [len(rejected_row["input_ids"]) for rejected_row in rejected_tokens]
-            batch["labels"] = [ [] for _ in chosen_tokens]
-            for i, chosen_row in enumerate(chosen_tokens):
-                batch["labels"][i] = [args.label_pad_token_id] * prompt_lens[i] + chosen_row["input_ids"] + [args.label_pad_token_id] + rejected_tokens[i]["input_ids"]
-
-            batch["length"] = [len(row["input_ids"]) for row in chosen_tokens]
-            batch["chosen_index"] = [prompt_len - 1 for prompt_len in prompt_lens]
-            batch["rejected_index"] = [prompt_len + chosen_len for prompt_len, chosen_len in zip(prompt_lens, chosen_lens)]
-            batch["end_index"] = [prompt_len + chosen_len + rejected_len + 1 for prompt_len, chosen_len, rejected_len in zip(prompt_lens, chosen_lens, rejected_lens)]
-            batch["position_ids"] = [list(range(prompt_len + chosen_len)) + list(range(prompt_len - 1, prompt_len + rejected_len)) for prompt_len, chosen_len, rejected_len in zip(prompt_lens, chosen_lens, rejected_lens)]
+        _maybe_process_batch_for_prefix_sharing(batch, idx, chosen_tokens, rejected_tokens, args)
     else:
         _tokenize_encoder_decoder(batch, tokenizer, features["prompt"], features["chosen"], features["rejected"], args)
 
@@ -514,6 +530,13 @@ class DPOTrainer(Trainer):
         if args.prefix_sharing and (data_collator or not isinstance(model, str)):
             raise ValueError("`model` or `data_collator` cannot be passed to the DPOTrainer as arguments with prefix sharing")
 
+        if args.enable_packing:
+            patch_torch_to_work_with_hf()
+            if not args.packing_length:
+                warnings.warn(
+                    "`packing_length` not provided, setting to 2*`max_length`"
+                )
+            args.packing_length = 2 * args.max_length
 
         if model_init_kwargs is not None:
             warnings.warn(
@@ -792,10 +815,17 @@ class DPOTrainer(Trainer):
             args.label_pad_token_id = label_pad_token_id
         if data_collator is None:
             if args.prefix_sharing:
-                data_collator = DPOPrefixSharingDataCollatorWithPadding(
-                pad_token_id=self.processing_class.pad_token_id,
-                label_pad_token_id=args.label_pad_token_id,
-            )
+                if args.enable_packing:
+                    data_collator = DPOPrefixSharingPackedDataCollatorWithPadding(
+                        max_length=args.packing_length, 
+                        pad_token_id=self.processing_class.pad_token_id, 
+                        label_pad_token_id=args.label_pad_token_id
+                    )
+                else:
+                    data_collator = DPOPrefixSharingDataCollatorWithPadding(
+                        pad_token_id=self.processing_class.pad_token_id,
+                        label_pad_token_id=args.label_pad_token_id,
+                    )
             else:
                 data_collator = DPODataCollatorWithPadding(
                     pad_token_id=self.processing_class.pad_token_id,
@@ -927,6 +957,7 @@ class DPOTrainer(Trainer):
                 _tokenize,
                 fn_kwargs=fn_kwargs,
                 batched=True,
+                with_indices=True,
                 num_proc=self.dataset_num_proc,
                 writer_batch_size=10,
                 desc="Tokenizing train dataset",
@@ -935,6 +966,7 @@ class DPOTrainer(Trainer):
                 eval_dataset = eval_dataset.map(
                     _tokenize,
                     fn_kwargs=fn_kwargs,
+                    with_indices=True,
                     batched=True,
                     num_proc=self.dataset_num_proc,
                     writer_batch_size=10,
@@ -1071,6 +1103,25 @@ class DPOTrainer(Trainer):
             )
 
             self._precomputed_train_ref_log_probs = True
+        
+        if self.args.enable_packing:
+            assert self.args.packing_length is not None, "max_length must be provided for packing"
+            dataloader_params = {
+                "collate_fn": self.data_collator,
+                "num_workers": self.args.dataloader_num_workers,
+                "pin_memory": self.args.dataloader_pin_memory,
+            }
+            sampler = MultipackBatchSampler(
+                sampler=RandomSampler(self.train_dataset),
+                batch_size=self.args.per_device_train_batch_size,
+                lengths=np.array(self.train_dataset["length"]),
+                batch_max_len=self.args.packing_length,
+            )
+            dataloader_params["batch_sampler"] = sampler
+            # prepare dataloader
+            data_loader = self.accelerator.prepare(DataLoader(self.train_dataset, **dataloader_params))
+            return data_loader
+
 
         return super().get_train_dataloader()
 
@@ -1427,10 +1478,7 @@ class DPOTrainer(Trainer):
             use_weighting: Whether to apply weighting as done in the [WPO](https://huggingface.co/papers/2406.11827) paper.
 
         Returns
-            A Tuple of three tensors of shape ((batch_size,), (batch_size,), Optional[(batch_size,)]) containing:
-            - The sum of log probabilities of the given labels under the given logits.
-            - The number of non-masked tokens.
-            - The wpo weighting (if use_weighting is True, otherwise None).
+            A tensor of shape (batch_size,) containing the sum of log probabilities of the given labels under the given logits.
         """
 
         loss_fct = nn.CrossEntropyLoss(ignore_index=self.label_pad_token_id, reduction="none")
@@ -1612,14 +1660,19 @@ class DPOTrainer(Trainer):
             super().log({f"{mode}_logps_time": logps_time / 1e3})
 
         # almost there
-        chosen_mask = torch.arange(seq_len).unsqueeze(0).unsqueeze(2).to(inputs_device) < batch["chosen_index"].unsqueeze(1).unsqueeze(2)
-        lower_bound = batch["chosen_index"].unsqueeze(1).unsqueeze(2).to(inputs_device)
-        upper_bound = batch["rejected_index"].unsqueeze(1).unsqueeze(2).to(inputs_device)
-        tensor = torch.arange(seq_len).unsqueeze(0).unsqueeze(2).to(inputs_device)
-        rejected_mask = ~ ( (lower_bound <= tensor ) & (tensor < upper_bound)) 
-        # upcast to float32 since maskedtensor doesn't support bfloat16 yet. 
-        chosen_logits = torch.masked.MaskedTensor(all_logits.to(torch.float32), chosen_mask.expand_as(all_logits))
-        rejected_logits =  torch.masked.MaskedTensor(all_logits.to(torch.float32), rejected_mask.expand_as(all_logits))
+        if not self.args.enable_packing:
+            chosen_mask = torch.arange(seq_len).unsqueeze(0).unsqueeze(2).to(inputs_device) < batch["chosen_index"].unsqueeze(1).unsqueeze(2)
+            lower_bound = batch["chosen_index"].unsqueeze(1).unsqueeze(2).to(inputs_device)
+            upper_bound = batch["rejected_index"].unsqueeze(1).unsqueeze(2).to(inputs_device)
+            tensor = torch.arange(seq_len).unsqueeze(0).unsqueeze(2).to(inputs_device)
+            rejected_mask = ~ ( (lower_bound <= tensor ) & (tensor < upper_bound)) 
+            # upcast to float32 since maskedtensor doesn't support bfloat16 yet. 
+            chosen_logits = torch.masked.MaskedTensor(all_logits.to(torch.float32), chosen_mask.expand_as(all_logits))
+            rejected_logits =  torch.masked.MaskedTensor(all_logits.to(torch.float32), rejected_mask.expand_as(all_logits))
+        else:
+            chosen_logits = torch.zeros(1)
+            rejected_logits = torch.zeros(1)
+
 
         return (
             logps_chosen,

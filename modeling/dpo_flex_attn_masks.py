@@ -30,9 +30,7 @@ def construct_dpo_mask_with_packing(sequence_id, chosen_index, rejected_index, e
             q_idx >= kv_idx
         )
         sequence_mask = seq_idx == sequence_id[b*index_seq_len + kv_idx]
-        # TODO: Confirm that this padding mask does not break anything
-        padding_mask = (kv_idx < end_index[b][kv_idx])
-        return dpo_prefix_sharing_mask & sequence_mask & padding_mask
+        return dpo_prefix_sharing_mask & sequence_mask
     
     block_mask = create_block_mask(document_causal_mask, B=batch_size, H=None, Q_LEN=seq_len, KV_LEN=seq_len, _compile=compile)
     return block_mask
