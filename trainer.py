@@ -33,6 +33,9 @@ from huggingface_hub.utils._deprecation import _deprecate_arguments
 from torch.utils.data import DataLoader
 from transformers import (
     AutoModelForCausalLM,
+    LlamaConfig,
+    MistralConfig,
+    AutoConfig,
     BaseImageProcessor,
     DataCollator,
     FeatureExtractionMixin,
@@ -64,9 +67,12 @@ from trl.trainer.utils import (
 from trl.data_utils import maybe_extract_prompt
 
 from data.utils import maybe_apply_chat_template
+from data.collators import DPOPrefixSharingPackedDataCollatorWithPadding, DPOPrefixSharingDataCollatorWithPadding
 from modeling.dpo_flex_attn_masks import construct_dpo_mask, construct_dpo_mask_with_packing
 from benchmark.utils import CudaTimer
 from config import DPOConfig, FDivergenceConstants, FDivergenceType
+from modeling.llama_patches import LlamaForCausalLMFlexAttn 
+from modeling.mistral_patches import MistralForCausalLMFlexAttn
 
 if is_peft_available():
     from peft import PeftModel, get_peft_model, prepare_model_for_kbit_training
@@ -115,7 +121,6 @@ if is_deepspeed_available():
                 # batch["position_ids"] = list(range(prompt_len + chosen_len)) + list(
                 #     range(prompt_len - 1, prompt_len + rejected_len)
                 # )
-LABEL_PAD_TOKEN_ID = -100
 
 def _tokenize(
     features: Dict[str, List],
@@ -506,6 +511,10 @@ class DPOTrainer(Trainer):
                 "same as `model`, you must mass a copy of it, or `None` if you use peft."
             )
 
+        if args.prefix_sharing and (data_collator or model):
+            raise ValueError("`model` or `data_collator` cannot be passed to the DPOTrainer as arguments with prefix sharing")
+
+
         if model_init_kwargs is not None:
             warnings.warn(
                 "You passed `model_init_kwargs` to the DPOTrainer, the value you passed will override the one in the `DPOConfig`."
@@ -561,14 +570,32 @@ class DPOTrainer(Trainer):
                 "You passed a model_id to the DPOTrainer. This will automatically create an "
                 "`AutoModelForCausalLM` or a `PeftModel` (if you passed a `peft_config`) for you."
             )
-            model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
+            if args.attn_implementation == "flex_attention":
+                config = AutoConfig.from_pretrained(model)
+                if isinstance(config, LlamaConfig):
+                    model = LlamaForCausalLMFlexAttn.from_pretrained(model, **model_init_kwargs)
+                elif isinstance(config, MistralConfig):
+                    model = MistralForCausalLMFlexAttn.from_pretrained(model, **model_init_kwargs)
+                else:
+                    raise NotImplementedError(f"flex attention not implemented for model {model}")
+            else:
+                model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
 
         if isinstance(ref_model, str):
             warnings.warn(
                 "You passed a ref model_id to the DPOTrainer. This will automatically create an "
                 "`AutoModelForCausalLM`"
             )
-            ref_model = AutoModelForCausalLM.from_pretrained(ref_model, **ref_model_init_kwargs)
+            if args.attn_implementation == "flex_attention":
+                config = AutoConfig.from_pretrained(ref_model)
+                if isinstance(config, LlamaConfig):
+                    model = LlamaForCausalLMFlexAttn.from_pretrained(ref_model, **ref_model_init_kwargs)
+                elif isinstance(config, MistralConfig):
+                    model = MistralForCausalLMFlexAttn.from_pretrained(ref_model, **ref_model_init_kwargs)
+                else:
+                    raise NotImplementedError(f"flex attention not implemented for model {model}")
+            else:
+                ref_model = AutoModelForCausalLM.from_pretrained(ref_model, **ref_model_init_kwargs)
 
         # Initialize this variable to False. This helps tracking the case when `peft_module_casting_to_bf16`
         # has been called in order to properly call autocast if needed.
@@ -764,11 +791,18 @@ class DPOTrainer(Trainer):
             )
             args.label_pad_token_id = label_pad_token_id
         if data_collator is None:
-            data_collator = DPODataCollatorWithPadding(
+            if args.prefix_sharing:
+                data_collator = DPOPrefixSharingDataCollatorWithPadding(
                 pad_token_id=self.processing_class.pad_token_id,
                 label_pad_token_id=args.label_pad_token_id,
                 is_encoder_decoder=self.is_encoder_decoder,
             )
+            else:
+                data_collator = DPODataCollatorWithPadding(
+                    pad_token_id=self.processing_class.pad_token_id,
+                    label_pad_token_id=args.label_pad_token_id,
+                    is_encoder_decoder=self.is_encoder_decoder,
+                )
 
             if args.remove_unused_columns:
                 args.remove_unused_columns = False
@@ -782,6 +816,7 @@ class DPOTrainer(Trainer):
             self.use_dpo_data_collator = True
         else:
             self.use_dpo_data_collator = False
+        
 
         if not disable_dropout:
             warnings.warn(
@@ -1374,6 +1409,55 @@ class DPOTrainer(Trainer):
 
         return losses, chosen_rewards, rejected_rewards
 
+    def get_batch_logps_prefix_sharing(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        chosen_indexes=None,
+        rejected_indexes=None,
+        loss_seq_id=None,
+    ) -> torch.Tensor:
+        """
+        Compute the log probabilities of the given labels under the given logits.
+
+        Args:
+            logits: Logits of the model (unnormalized). Shape: (batch_size, sequence_length, vocab_size)
+            labels: Labels for which to compute the log probabilities. Label tokens with a value of label_pad_token_id are ignored. Shape: (batch_size, sequence_length)
+            label_pad_token_id: The label pad token id.
+            is_encoder_decoder: Whether the model is an encoder-decoder model.
+            use_weighting: Whether to apply weighting as done in the [WPO](https://huggingface.co/papers/2406.11827) paper.
+
+        Returns
+            A Tuple of three tensors of shape ((batch_size,), (batch_size,), Optional[(batch_size,)]) containing:
+            - The sum of log probabilities of the given labels under the given logits.
+            - The number of non-masked tokens.
+            - The wpo weighting (if use_weighting is True, otherwise None).
+        """
+
+        loss_fct = nn.CrossEntropyLoss(ignore_index=self.label_pad_token_id, reduction="none")
+
+        logps = -loss_fct(logits.permute(0, 2, 1)[..., :-1], labels[..., 1:])
+        if chosen_indexes is None or rejected_indexes is None:
+            logps = logps.sum(dim=-1)
+        else:
+            if loss_seq_id is None:
+                logps_chosen = self.sum_between_indexes(
+                    logps, chosen_indexes, rejected_indexes - 1
+                )  # the last prediction needs to be removed since that label is in the rejected message
+                logps_rejected = self.sum_between_indexes(
+                    logps, rejected_indexes, torch.ones(len(rejected_indexes)) * 100000
+                )
+            else:
+                # first loss will be 0, is for padding
+                assert loss_seq_id[:, :-1].shape == logps.shape
+                losses = torch.zeros(torch.max(loss_seq_id) + 1, device=logps.device, dtype=logps.dtype).scatter_add_(
+                    0, loss_seq_id[:, :-1].flatten(), logps.flatten()
+                )
+                logps_chosen, logps_rejected = losses[1:].reshape(-1, 2).T
+            return logps_chosen, logps_rejected
+        
+        return logps
+
     @staticmethod
     def get_batch_logps(
         logits: torch.FloatTensor,
@@ -1428,21 +1512,14 @@ class DPOTrainer(Trainer):
         self,
         model: nn.Module,
         batch: Dict[str, Union[List, torch.LongTensor]],
-        is_ref_model: bool = False,
-        mode: Literal["train", "eval", "ref", "other"] = "other",
+        mode: Literal["train", "eval", "ref", "other"] = "ref",
     ):
         seq_len = batch["input_ids"].shape[-1]
         assert (
             batch["position_ids"].shape[-1] == seq_len
         ), f"position ids array is invalid, expected seq len {seq_len} but got array {batch['position_ids'].shape[-1]}"
         inputs_device = self.accelerator.device
-        if self.accelerator.is_main_process and self.args.debug_outputs:
-            import pickle
 
-            with open("inputs.pkl", "wb") as f:
-                pickle.dump(batch, f)
-        if is_ref_model and self.args.ref_eval_mode:
-            inputs_device = "cpu"
         with CudaTimer(device=self.accelerator.device) as fwd_timer:
             if self.use_flex_attn:
                 if self.args.enable_packing:
@@ -1495,7 +1572,7 @@ class DPOTrainer(Trainer):
 
         all_logits = outputs.logits
         with CudaTimer(device=self.accelerator.device) as logps_timer:
-            logps_chosen, logps_rejected = self.get_logps(
+            logps_chosen, logps_rejected = self.get_batch_logps_prefix_sharing(
                 all_logits,
                 batch["labels"].to(inputs_device),
                 chosen_indexes=batch["chosen_index"].to(inputs_device),
@@ -1507,11 +1584,16 @@ class DPOTrainer(Trainer):
             # don't use dpoTrainer's .log because it is shit
             super().log({f"{mode}_logps_time": logps_time / 1e3})
 
+        chosen_mask = torch.arange(seq_len).unsqueeze(0).unsqueeze(2) < batch["chosen_index"].unsqueeze(1).unsqueeze(2)
+        rejected_mask = ~ (batch["chosen_index"].unsqueeze(1).unsqueeze(2) <= torch.arange(seq_len).unsqueeze(0).unsqueeze(2) < batch["rejected_index"].unsqueeze(1).unsqueeze(2)) 
+        chosen_logits = torch.where(all_logits, chosen_mask)
+        rejected_logits = torch.where(all_logits, rejected_mask)
+
         return (
             logps_chosen,
             logps_rejected,
-            logps_chosen / 10,
-            logps_rejected / 10,
+            chosen_logits,
+            rejected_logits,
             logps_chosen.sum(),
         )  # only first two matter, last three are dummy for now
 
@@ -1621,8 +1703,10 @@ class DPOTrainer(Trainer):
     ):
         """Compute the DPO loss and other metrics for the given batch of inputs for train or test."""
         metrics = {}
-
-        forward_output = self.concatenated_forward(model, batch)
+        forward_func = self.prefix_sharing_forward if self.args.prefix_sharing else self.concatenated_forward
+        forward_kwargs = {"mode": train_eval} if self.args.prefix_sharing else {}
+        forward_output = forward_func(model, batch, **forward_kwargs)
+            
         (
             policy_chosen_logps,
             policy_rejected_logps,
@@ -1646,11 +1730,11 @@ class DPOTrainer(Trainer):
             with torch.no_grad():
                 if self.ref_model is None:
                     with self.null_ref_context():
-                        reference_chosen_logps, reference_rejected_logps = self.concatenated_forward(
+                        reference_chosen_logps, reference_rejected_logps = forward_func(
                             self.model, batch
                         )[:2]
                 else:
-                    reference_chosen_logps, reference_rejected_logps = self.concatenated_forward(
+                    reference_chosen_logps, reference_rejected_logps = forward_func(
                         self.ref_model, batch
                     )[:2]
 
