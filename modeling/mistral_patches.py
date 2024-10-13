@@ -1,23 +1,22 @@
 from typing import Dict, Optional, Union
 
 import torch
-from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from transformers.cache_utils import Cache
-from transformers.models.mistral.modeling_mistral import *
-from transformers.utils import (
-    is_torch_xla_available,
-    logging,
+from transformers.models.mistral.modeling_mistral import (
+    MistralAttention,
+    MistralForCausalLM,
+    MistralModel,
+    MISTRAL_ATTENTION_CLASSES,
+    apply_rotary_pos_emb,
+    repeat_kv
 )
-
-
-logger = logging.get_logger(__name__)
 
 
 class MistralFlexAttention(MistralAttention):
     """
-    Mistral flash attention module. This module inherits from `MistralAttention` as the weights of the module stays
-    untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
-    flash attention and deal with padding tokens in case the input contains any of them.
+    Modified version of MistralFlashAttention2 to use FlexAttention
+    Adapted from https://github.com/huggingface/transformers/blob/37ea04013b34b39c01b51aeaacd8d56f2c62a7eb/src/transformers/models/mistral/modeling_mistral.py#L270
     """
 
     def __init__(self, *args, **kwargs):
@@ -50,7 +49,7 @@ class MistralFlexAttention(MistralAttention):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        assert self.attention_dropout == 0  # dropout_rate = 0.0 if not self.training else self.attention_dropout
+        assert self.attention_dropout == 0 # flex attention does not directly support dropout yet
 
         # In PEFT, usually we cast the layer norms in float32 for training stability reasons
         # therefore the input hidden states gets silently casted in float32. Hence, we need
@@ -70,14 +69,14 @@ class MistralFlexAttention(MistralAttention):
             value_states = value_states.to(target_dtype)
 
         if attention_mask is None:
-            raise RuntimeError("No mask specified")
+            raise RuntimeError("No attention mask specified")
 
         assert q_len % 128 == 0, f"flex_attention requires seq len to be divisble by 128, but got seq of length {q_len}"
         assert attention_mask.shape == (bsz, 1, q_len, q_len) or attention_mask.shape == (1, 1, q_len, q_len), f"got attention_mask of shape {attention_mask.shape}, expected {(bsz, 1, q_len, q_len)} or {(1, 1, q_len, q_len)}"
 
         attn_output = self.flex_attention_compiled(
             query_states, key_states, value_states, block_mask=attention_mask
-        ).permute(0, 2, 1, 3)
+        ).transpose(1, 2)
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -85,7 +84,7 @@ class MistralFlexAttention(MistralAttention):
         return attn_output, None, None
 
 
-def hijack_flash_attention(config):
+def patch_flash_attention(config):
     MISTRAL_ATTENTION_CLASSES["flex_attention"] = MistralFlexAttention
     # due to how python's name mangling works, you can't directly override a private method with subclassing without also override the public methods where it's used
     MistralForCausalLM._update_causal_mask = MistralForCausalLMFlexAttn._update_causal_mask
@@ -98,7 +97,7 @@ def hijack_flash_attention(config):
 
 class MistralForCausalLMFlexAttn(MistralForCausalLM):
     def __init__(self, config):
-        config = hijack_flash_attention(config)
+        config = patch_flash_attention(config)
         super().__init__(config)
 
         # set flex_attention_compiled for all layers
@@ -131,52 +130,3 @@ class MistralForCausalLMFlexAttn(MistralForCausalLM):
         check_device_map: bool = True,
     ):
         return config
-
-
-def construct_dpo_mask(chosen_index, rejected_index, seq_len, compile=False):
-    def dpo_mask(b, h, q_idx, kv_idx):
-        return (~((q_idx >= rejected_index[b]) & (chosen_index[b] <= kv_idx) & (kv_idx < rejected_index[b]))) & (
-            q_idx >= kv_idx
-        )
-
-    block_mask = create_block_mask(
-        dpo_mask, B=len(chosen_index), H=None, Q_LEN=seq_len, KV_LEN=seq_len, _compile=compile
-    )
-    return block_mask
-
-
-def construct_causal_mask(seq_len):
-    def causal(b, h, q_idx, kv_idx):
-        return q_idx >= kv_idx
-
-    block_mask = create_block_mask(
-        causal, B=None, H=None, Q_LEN=seq_len, KV_LEN=seq_len, _compile=False
-    )
-    return block_mask
-
-def construct_dpo_mask_with_packing_old(sequence_id_flattened, chosen_index, rejected_index, end_index, seq_len, batch_size):
-    def document_causal_mask(b, h, q_idx, kv_idx):
-        seq_idx =  sequence_id_flattened[b*seq_len + q_idx]
-        dpo_prefix_sharing_mask = (~((q_idx >= rejected_index[seq_idx]) & (chosen_index[seq_idx] <= kv_idx) & (kv_idx < rejected_index[seq_idx]))) & (
-            q_idx >= kv_idx
-        )
-        sequence_mask = seq_idx == sequence_id_flattened[b*seq_len + kv_idx]
-        # padding_mask = (kv_idx < end_index[b][kv_idx])
-        return dpo_prefix_sharing_mask & sequence_mask
-    
-    block_mask = create_block_mask(document_causal_mask, B=batch_size, H=None, Q_LEN=seq_len, KV_LEN=seq_len, _compile=False)
-    return block_mask
-
-# All flattened
-def construct_dpo_mask_with_packing(sequence_id, chosen_index, rejected_index, end_index, batch_size, seq_len, index_seq_len, compile=False):
-    def document_causal_mask(b, h, q_idx, kv_idx):
-        seq_idx =  sequence_id[b*index_seq_len + q_idx]
-        dpo_prefix_sharing_mask = (~((q_idx >= rejected_index[b*index_seq_len + q_idx]) & (chosen_index[b*index_seq_len + q_idx] <= kv_idx) & (kv_idx < rejected_index[b*index_seq_len + q_idx]))) & (
-            q_idx >= kv_idx
-        )
-        sequence_mask = seq_idx == sequence_id[b*index_seq_len + kv_idx]
-        # padding_mask = (kv_idx < end_index[b][kv_idx])
-        return dpo_prefix_sharing_mask & sequence_mask
-    
-    block_mask = create_block_mask(document_causal_mask, B=batch_size, H=None, Q_LEN=seq_len, KV_LEN=seq_len, _compile=compile)
-    return block_mask
