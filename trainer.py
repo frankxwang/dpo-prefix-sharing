@@ -1612,19 +1612,20 @@ class DPOTrainer(Trainer):
             super().log({f"{mode}_logps_time": logps_time / 1e3})
 
         # almost there
-        # chosen_mask = torch.arange(seq_len).unsqueeze(0).unsqueeze(2).to(inputs_device) < batch["chosen_index"].unsqueeze(1).unsqueeze(2)
-        # lower_bound = batch["chosen_index"].unsqueeze(1).unsqueeze(2).to(inputs_device)
-        # upper_bound = batch["rejected_index"].unsqueeze(1).unsqueeze(2).to(inputs_device)
-        # tensor = torch.arange(seq_len).unsqueeze(0).unsqueeze(2).to(inputs_device)
-        # rejected_mask = ~ ( (lower_bound <= tensor ) & (tensor < upper_bound)) 
-        # chosen_logits = torch.masked.MaskedTensor(all_logits, chosen_mask)
-        # rejected_logits =  torch.masked.MaskedTensor(all_logits, rejected_mask)
+        chosen_mask = torch.arange(seq_len).unsqueeze(0).unsqueeze(2).to(inputs_device) < batch["chosen_index"].unsqueeze(1).unsqueeze(2)
+        lower_bound = batch["chosen_index"].unsqueeze(1).unsqueeze(2).to(inputs_device)
+        upper_bound = batch["rejected_index"].unsqueeze(1).unsqueeze(2).to(inputs_device)
+        tensor = torch.arange(seq_len).unsqueeze(0).unsqueeze(2).to(inputs_device)
+        rejected_mask = ~ ( (lower_bound <= tensor ) & (tensor < upper_bound)) 
+        # upcast to float32 since maskedtensor doesn't support bfloat16 yet. 
+        chosen_logits = torch.masked.MaskedTensor(all_logits.to(torch.float32), chosen_mask.expand_as(all_logits))
+        rejected_logits =  torch.masked.MaskedTensor(all_logits.to(torch.float32), rejected_mask.expand_as(all_logits))
 
         return (
             logps_chosen,
             logps_rejected,
-            logps_chosen / 10,
-            logps_rejected / 10,
+            chosen_logits,
+            rejected_logits,
             logps_chosen.sum(),
             None, # dummy for now
         )  # only first two matter, last three are dummy for now
@@ -1791,9 +1792,10 @@ class DPOTrainer(Trainer):
         metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean().cpu()
         metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean().cpu()
         metrics[f"{prefix}logps/rejected"] = policy_rejected_logps.detach().mean().cpu()
-        metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().mean().cpu()
-        metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.detach().mean().cpu()
-        metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu()
+        metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().mean().cpu() 
+        # Use .item explicitly since we use MaskedTensor for prefix sharing
+        metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.detach().mean().cpu().item()
+        metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu().item()
         if self.args.rpo_alpha is not None:
             metrics[f"{prefix}nll_loss"] = policy_nll_loss.detach().mean().cpu()
 
