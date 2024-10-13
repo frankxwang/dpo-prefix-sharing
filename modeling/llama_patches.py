@@ -92,7 +92,7 @@ class LlamaFlexAttention(LlamaAttention):
         assert attention_mask.shape == (bsz, 1, q_len, q_len) or attention_mask.shape == (1, 1, q_len, q_len), f"got attention_mask of shape {attention_mask.shape}, expected {(bsz, 1, q_len, q_len)} or {(1, 1, q_len, q_len)}"
 
         attn_output = self.flex_attention_compiled(
-            query_states, key_states, value_states, block_mask=attention_mask
+            query_states, key_states, value_states, block_mask=attention_mask, enable_gqa=True
         ).transpose(1, 2)
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim).contiguous()
