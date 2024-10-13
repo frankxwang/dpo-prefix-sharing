@@ -1,7 +1,7 @@
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 import torch
-import trl.trainer.utils import pad, pad_to_length
+from trl.trainer.utils import pad, pad_to_length
 
 
 @dataclass

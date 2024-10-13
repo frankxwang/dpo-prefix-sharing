@@ -179,6 +179,8 @@ class DPOConfig(TrainingArguments):
     use_flex_attn: bool = False 
     prefix_sharing: bool = False 
     enable_packing: bool = False
+    max_train_samples: Optional[int] = None
+    max_eval_samples: Optional[int] = None
 
     def __post_init__(self):
         if self.max_target_length is not None:

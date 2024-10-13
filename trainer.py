@@ -157,13 +157,13 @@ def _tokenize(
 
         if args.prefix_sharing:
             for k in ['input_ids', 'attention_mask']:
-                batch[k] = [chosen_tokens[i]["prompt_{k}"] + chosen_tokens[i][k] + chosen_tokens[i]["prompt_{k}"][-1:] + rejected_tokens[i][k] for i in range(len(chosen_tokens))]
+                batch[k] = [chosen_tokens[i][f"prompt_{k}"] + chosen_tokens[i][k] + chosen_tokens[i][f"prompt_{k}"][-1:] + rejected_tokens[i][k] for i in range(len(chosen_tokens))]
             prompt_lens = [len(chosen_row["prompt_input_ids"]) for chosen_row in chosen_tokens]
             chosen_lens = [len(chosen_row["input_ids"]) for chosen_row in chosen_tokens]
             rejected_lens = [len(rejected_row["input_ids"]) for rejected_row in rejected_tokens]
             batch["labels"] = [ [] for _ in chosen_tokens]
             for i, chosen_row in enumerate(chosen_tokens):
-                batch["labels"] = [args.label_pad_token_id] * prompt_lens[i] + chosen_row["input_ids"] + [args.label_pad_token_id] + rejected_tokens[i]["input_ids"]
+                batch["labels"][i] = [args.label_pad_token_id] * prompt_lens[i] + chosen_row["input_ids"] + [args.label_pad_token_id] + rejected_tokens[i]["input_ids"]
 
             batch["length"] = [len(row["input_ids"]) for row in chosen_tokens]
             batch["chosen_index"] = [prompt_len - 1 for prompt_len in prompt_lens]
@@ -511,7 +511,7 @@ class DPOTrainer(Trainer):
                 "same as `model`, you must mass a copy of it, or `None` if you use peft."
             )
 
-        if args.prefix_sharing and (data_collator or model):
+        if args.prefix_sharing and (data_collator or not isinstance(model, str)):
             raise ValueError("`model` or `data_collator` cannot be passed to the DPOTrainer as arguments with prefix sharing")
 
 
@@ -570,7 +570,7 @@ class DPOTrainer(Trainer):
                 "You passed a model_id to the DPOTrainer. This will automatically create an "
                 "`AutoModelForCausalLM` or a `PeftModel` (if you passed a `peft_config`) for you."
             )
-            if args.attn_implementation == "flex_attention":
+            if args.prefix_sharing:
                 config = AutoConfig.from_pretrained(model)
                 if isinstance(config, LlamaConfig):
                     model = LlamaForCausalLMFlexAttn.from_pretrained(model, **model_init_kwargs)
@@ -586,12 +586,12 @@ class DPOTrainer(Trainer):
                 "You passed a ref model_id to the DPOTrainer. This will automatically create an "
                 "`AutoModelForCausalLM`"
             )
-            if args.attn_implementation == "flex_attention":
+            if args.prefix_sharing:
                 config = AutoConfig.from_pretrained(ref_model)
                 if isinstance(config, LlamaConfig):
-                    model = LlamaForCausalLMFlexAttn.from_pretrained(ref_model, **ref_model_init_kwargs)
+                    ref_model = LlamaForCausalLMFlexAttn.from_pretrained(ref_model, **ref_model_init_kwargs)
                 elif isinstance(config, MistralConfig):
-                    model = MistralForCausalLMFlexAttn.from_pretrained(ref_model, **ref_model_init_kwargs)
+                    ref_model = MistralForCausalLMFlexAttn.from_pretrained(ref_model, **ref_model_init_kwargs)
                 else:
                     raise NotImplementedError(f"flex attention not implemented for model {model}")
             else:
@@ -795,7 +795,6 @@ class DPOTrainer(Trainer):
                 data_collator = DPOPrefixSharingDataCollatorWithPadding(
                 pad_token_id=self.processing_class.pad_token_id,
                 label_pad_token_id=args.label_pad_token_id,
-                is_encoder_decoder=self.is_encoder_decoder,
             )
             else:
                 data_collator = DPODataCollatorWithPadding(
@@ -1457,6 +1456,34 @@ class DPOTrainer(Trainer):
             return logps_chosen, logps_rejected
         
         return logps
+    
+    def sum_between_indexes(self, tensor, indexes_start, indexes_end, with_packing: bool = False):
+        if with_packing:
+            assert indexes_start.ndim == 3
+            assert indexes_end.ndim == 3
+            assert tensor.ndim == 3
+            seqs, batch_size, sequence_length = tensor.shape
+            # Create a range tensor for each batch
+            range_tensor = torch.arange(sequence_length, device=tensor.device).expand_as(tensor)
+            mask = (indexes_start <= range_tensor) & (range_tensor < indexes_end)
+            # sum over indexes per sequence and collapse the sequence dimension
+            result = (tensor * mask.float()).sum(dim=-1).sum(dim=0)
+        else:
+            batch_size, sequence_length = tensor.shape
+
+            indexes_start = indexes_start.to(tensor.device)
+            indexes_end = indexes_end.to(tensor.device)
+
+            # Create a range tensor for each batch
+            range_tensor = torch.arange(sequence_length, device=tensor.device).expand(batch_size, -1).to(tensor.device)
+
+            # Create a mask for the range we want to sum
+            mask = (range_tensor >= indexes_start.unsqueeze(1)) & (range_tensor < indexes_end.unsqueeze(1))
+
+            # Apply the mask and sum
+            result = (tensor * mask.float()).sum(dim=-1)
+
+        return result
 
     @staticmethod
     def get_batch_logps(
@@ -1521,7 +1548,7 @@ class DPOTrainer(Trainer):
         inputs_device = self.accelerator.device
 
         with CudaTimer(device=self.accelerator.device) as fwd_timer:
-            if self.use_flex_attn:
+            if self.args.prefix_sharing:
                 if self.args.enable_packing:
                     dpo_mask = construct_dpo_mask_with_packing(
                         batch["sequence_id"].to(inputs_device).flatten(),
@@ -1584,17 +1611,22 @@ class DPOTrainer(Trainer):
             # don't use dpoTrainer's .log because it is shit
             super().log({f"{mode}_logps_time": logps_time / 1e3})
 
-        chosen_mask = torch.arange(seq_len).unsqueeze(0).unsqueeze(2) < batch["chosen_index"].unsqueeze(1).unsqueeze(2)
-        rejected_mask = ~ (batch["chosen_index"].unsqueeze(1).unsqueeze(2) <= torch.arange(seq_len).unsqueeze(0).unsqueeze(2) < batch["rejected_index"].unsqueeze(1).unsqueeze(2)) 
-        chosen_logits = torch.where(all_logits, chosen_mask)
-        rejected_logits = torch.where(all_logits, rejected_mask)
+        # almost there
+        # chosen_mask = torch.arange(seq_len).unsqueeze(0).unsqueeze(2).to(inputs_device) < batch["chosen_index"].unsqueeze(1).unsqueeze(2)
+        # lower_bound = batch["chosen_index"].unsqueeze(1).unsqueeze(2).to(inputs_device)
+        # upper_bound = batch["rejected_index"].unsqueeze(1).unsqueeze(2).to(inputs_device)
+        # tensor = torch.arange(seq_len).unsqueeze(0).unsqueeze(2).to(inputs_device)
+        # rejected_mask = ~ ( (lower_bound <= tensor ) & (tensor < upper_bound)) 
+        # chosen_logits = torch.masked.MaskedTensor(all_logits, chosen_mask)
+        # rejected_logits =  torch.masked.MaskedTensor(all_logits, rejected_mask)
 
         return (
             logps_chosen,
             logps_rejected,
-            chosen_logits,
-            rejected_logits,
+            logps_chosen / 10,
+            logps_rejected / 10,
             logps_chosen.sum(),
+            None, # dummy for now
         )  # only first two matter, last three are dummy for now
 
 
