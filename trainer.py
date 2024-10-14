@@ -90,42 +90,42 @@ if is_deepspeed_available():
 
 
 # batch is a misnomer this is just a row
-                # batch = {
-                #     k: chosen_tokens[f"prompt_{k}"]
-                #     + chosen_tokens[k]
-                #     + chosen_tokens[f"prompt_{k}"][-1:]
-                #     + rejected_tokens[k]
-                #     for k in ["input_ids", "attention_mask"]
-                # }
-                # prompt_len = len(chosen_tokens["prompt_input_ids"])
-                # chosen_len = len(chosen_tokens["input_ids"])
-                # rejected_len = len(rejected_tokens["input_ids"])
-                # # we need to ignore the last chosen token
-                # batch["labels"] = (
-                #     [self.label_pad_token_id] * prompt_len
-                #     + chosen_tokens["input_ids"]
-                #     + [self.label_pad_token_id]
-                #     + rejected_tokens["input_ids"]
-                # )
-                # batch["length"] = len(batch["input_ids"])
-                # if self.args.enable_packing:
-                #     batch["sequence_id"] = [idx for _ in range(batch["length"])]
-                #     batch["chosen_index"] = [prompt_len - 1 for _ in range(batch["length"])]
-                #     batch["rejected_index"] = [prompt_len + chosen_len for _ in range(batch["length"])]
-                #     batch["end_index"] = [prompt_len + chosen_len + rejected_len + 1 for _ in range(batch["length"])]
-                # else:
-                #     batch["sequence_id"] = idx
-                #     # the chosen index starts from the final prompt token
-                #     batch["chosen_index"] = prompt_len - 1
-                #     batch["rejected_index"] = prompt_len + chosen_len
-                #     # the end index needs an extra +1 for the extra final prompt token
-                #     batch["end_index"] = prompt_len + chosen_len + rejected_len + 1
-                # # for the rejected sequence, we start from the final prompt token
-                # batch["position_ids"] = list(range(prompt_len + chosen_len)) + list(
-                #     range(prompt_len - 1, prompt_len + rejected_len)
-                # )
+# batch = {
+#     k: chosen_tokens[f"prompt_{k}"]
+#     + chosen_tokens[k]
+#     + chosen_tokens[f"prompt_{k}"][-1:]
+#     + rejected_tokens[k]
+#     for k in ["input_ids", "attention_mask"]
+# }
+# prompt_len = len(chosen_tokens["prompt_input_ids"])
+# chosen_len = len(chosen_tokens["input_ids"])
+# rejected_len = len(rejected_tokens["input_ids"])
+# # we need to ignore the last chosen token
+# batch["labels"] = (
+#     [self.label_pad_token_id] * prompt_len
+#     + chosen_tokens["input_ids"]
+#     + [self.label_pad_token_id]
+#     + rejected_tokens["input_ids"]
+# )
+# batch["length"] = len(batch["input_ids"])
+# if self.args.enable_packing:
+#     batch["sequence_id"] = [idx for _ in range(batch["length"])]
+#     batch["chosen_index"] = [prompt_len - 1 for _ in range(batch["length"])]
+#     batch["rejected_index"] = [prompt_len + chosen_len for _ in range(batch["length"])]
+#     batch["end_index"] = [prompt_len + chosen_len + rejected_len + 1 for _ in range(batch["length"])]
+# else:
+#     batch["sequence_id"] = idx
+#     # the chosen index starts from the final prompt token
+#     batch["chosen_index"] = prompt_len - 1
+#     batch["rejected_index"] = prompt_len + chosen_len
+#     # the end index needs an extra +1 for the extra final prompt token
+#     batch["end_index"] = prompt_len + chosen_len + rejected_len + 1
+# # for the rejected sequence, we start from the final prompt token
+# batch["position_ids"] = list(range(prompt_len + chosen_len)) + list(
+#     range(prompt_len - 1, prompt_len + rejected_len)
+# )
 
-def _maybe_process_batch_for_prefix_sharing(batch, idx: int, chosen_tokens, rejected_tokens, args):
+def _maybe_process_batch_for_prefix_sharing(batch, indexes: List[int], chosen_tokens, rejected_tokens, args):
     if args.prefix_sharing:
         for k in ['input_ids', 'attention_mask']:
             batch[k] = [chosen_tokens[i][f"prompt_{k}"] + chosen_tokens[i][k] + chosen_tokens[i][f"prompt_{k}"][-1:] + rejected_tokens[i][k] for i in range(len(chosen_tokens))]
@@ -140,7 +140,7 @@ def _maybe_process_batch_for_prefix_sharing(batch, idx: int, chosen_tokens, reje
         batch["position_ids"] = [list(range(prompt_len + chosen_len)) + list(range(prompt_len - 1, prompt_len + rejected_len)) for prompt_len, chosen_len, rejected_len in zip(prompt_lens, chosen_lens, rejected_lens)]
 
         if args.enable_packing:
-            batch["sequence_id"] = [[idx for _ in range(length)] for length in batch["length"]]
+            batch["sequence_id"] = [[idx for _ in range(length)] for idx, length in zip(indexes, batch["length"]) ]
             batch["chosen_index"] = [[prompt_len - 1 for _ in range(length)] for prompt_len, length in zip(prompt_lens, batch["length"])]
             batch["rejected_index"] = [[prompt_len + chosen_len for _ in range(length)]for prompt_len, chosen_len, length in zip(prompt_lens, chosen_lens, batch["length"])]
             batch["end_index"] =[[prompt_len + chosen_len + rejected_len + 1 for _ in range(length)] for prompt_len, chosen_len, rejected_len, length in zip(prompt_lens, chosen_lens, rejected_lens, batch["length"])]
@@ -153,7 +153,7 @@ def _maybe_process_batch_for_prefix_sharing(batch, idx: int, chosen_tokens, reje
 
 def _tokenize(
     features: Dict[str, List],
-    idx: int,
+    indexes: List[int],
     tokenizer: PreTrainedTokenizerBase,
     args: DPOConfig,
     processor: Optional[Callable] = None,
@@ -185,7 +185,7 @@ def _tokenize(
 
         _append_prompt_tokens_to_batch(batch, prompt_tokens)
 
-        _maybe_process_batch_for_prefix_sharing(batch, idx, chosen_tokens, rejected_tokens, args)
+        _maybe_process_batch_for_prefix_sharing(batch, indexes, chosen_tokens, rejected_tokens, args)
     else:
         _tokenize_encoder_decoder(batch, tokenizer, features["prompt"], features["chosen"], features["rejected"], args)
 
@@ -1466,6 +1466,7 @@ class DPOTrainer(Trainer):
         chosen_indexes=None,
         rejected_indexes=None,
         loss_seq_id=None,
+        mode =None,
     ) -> torch.Tensor:
         """
         Compute the log probabilities of the given labels under the given logits.
@@ -1500,6 +1501,10 @@ class DPOTrainer(Trainer):
                 losses = torch.zeros(torch.max(loss_seq_id) + 1, device=logps.device, dtype=logps.dtype).scatter_add_(
                     0, loss_seq_id[:, :-1].flatten(), logps.flatten()
                 )
+                # if self.accelerator.is_main_process and mode:
+                #     with open("outputs.pkl", "wb") as f:
+                #         import pickle
+                #         pickle.dump({"logps": logps.detach().cpu(), "loss_seq_id": loss_seq_id, "losses": losses.detach().cpu()}, f)
                 logps_chosen, logps_rejected = losses[1:].reshape(-1, 2).T
             return logps_chosen, logps_rejected
         
@@ -1595,6 +1600,10 @@ class DPOTrainer(Trainer):
         ), f"position ids array is invalid, expected seq len {seq_len} but got array {batch['position_ids'].shape[-1]}"
         inputs_device = self.accelerator.device
 
+        # if self.accelerator.is_main_process and mode=="train":
+        #     with open("inputs.pkl", "wb") as f:
+        #         import pickle
+        #         pickle.dump(batch, f)
         with CudaTimer(device=self.accelerator.device) as fwd_timer:
             if self.args.prefix_sharing:
                 if self.args.enable_packing:
@@ -1653,13 +1662,13 @@ class DPOTrainer(Trainer):
                 chosen_indexes=batch["chosen_index"].to(inputs_device),
                 rejected_indexes=batch["rejected_index"].to(inputs_device),
                 loss_seq_id=batch["loss_seq_id"].to(inputs_device) if "loss_seq_id" in batch else None,
+                mode="train" if mode=="train" else None,
             )
         logps_time = logps_timer.elapsed_time
         if mode == "train":
             # don't use dpoTrainer's .log because it is shit
             super().log({f"{mode}_logps_time": logps_time / 1e3})
 
-        # almost there
         if not self.args.enable_packing:
             chosen_mask = torch.arange(seq_len).unsqueeze(0).unsqueeze(2).to(inputs_device) < batch["chosen_index"].unsqueeze(1).unsqueeze(2)
             lower_bound = batch["chosen_index"].unsqueeze(1).unsqueeze(2).to(inputs_device)
@@ -1670,9 +1679,9 @@ class DPOTrainer(Trainer):
             chosen_logits = torch.masked.MaskedTensor(all_logits.to(torch.float32), chosen_mask.expand_as(all_logits))
             rejected_logits =  torch.masked.MaskedTensor(all_logits.to(torch.float32), rejected_mask.expand_as(all_logits))
         else:
+            # NOTE: dummy logits when packing is enabled since there are just used for logging.
             chosen_logits = torch.zeros(1)
             rejected_logits = torch.zeros(1)
-
 
         return (
             logps_chosen,
@@ -1823,13 +1832,19 @@ class DPOTrainer(Trainer):
                     reference_chosen_logps, reference_rejected_logps = forward_func(
                         self.ref_model, batch
                     )[:2]
-
+        # if self.accelerator.is_main_process:
+        #     with open("final_logps.pkl", "wb") as f:
+        #         import pickle
+        #         pickle.dump([policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps], f)
+        
         losses, chosen_rewards, rejected_rewards = self.dpo_loss(
             policy_chosen_logps,
             policy_rejected_logps,
             reference_chosen_logps,
             reference_rejected_logps,
         )
+        # print(losses)
+        # exit()
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
         if self.args.rpo_alpha is not None:

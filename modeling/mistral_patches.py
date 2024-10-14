@@ -81,7 +81,6 @@ class MistralFlexAttention(MistralAttention):
 
 def patch_flash_attention(config):
     MISTRAL_ATTENTION_CLASSES["flex_attention"] = MistralFlexAttention
-    # due to how python's name mangling works, you can't directly override a private method with subclassing without also override the public methods where it's used
     MistralForCausalLM._update_causal_mask = MistralForCausalLMFlexAttn._update_causal_mask
     MistralModel._update_causal_mask = MistralForCausalLMFlexAttn._update_causal_mask
     MistralForCausalLM._autoset_attn_implementation = MistralForCausalLMFlexAttn._autoset_attn_implementation
