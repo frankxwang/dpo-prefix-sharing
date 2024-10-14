@@ -2,6 +2,7 @@ from torch.nn.attention.flex_attention import create_block_mask
 
 
 def construct_causal_mask(seq_len, compile=False):
+    """Simple causal block mask for causal LMs"""
     def causal(b, h, q_idx, kv_idx):
         return q_idx >= kv_idx
 
@@ -12,6 +13,7 @@ def construct_causal_mask(seq_len, compile=False):
 
 
 def construct_dpo_mask(chosen_index, rejected_index, seq_len, compile=False):
+    """Block-sparse mask for prefix shared inputs"""
     def dpo_mask(b, h, q_idx, kv_idx):
         return (~((q_idx >= rejected_index[b]) & (chosen_index[b] <= kv_idx) & (kv_idx < rejected_index[b]))) & (
             q_idx >= kv_idx
@@ -25,6 +27,7 @@ def construct_dpo_mask(chosen_index, rejected_index, seq_len, compile=False):
 def construct_dpo_mask_with_packing(
     sequence_id, chosen_index, rejected_index, end_index, batch_size, seq_len, index_seq_len, compile=False
 ):
+    """Block-sparse mask for packed prefix shared inputs"""
     def document_causal_mask(b, h, q_idx, kv_idx):
         seq_idx = sequence_id[b * index_seq_len + q_idx]
         dpo_prefix_sharing_mask = (
@@ -35,6 +38,7 @@ def construct_dpo_mask_with_packing(
             )
         ) & (q_idx >= kv_idx)
         sequence_mask = seq_idx == sequence_id[b * index_seq_len + kv_idx]
+        # no longer needed because seq_id padding takes care of this
         # padding_mask = (kv_idx < end_index[b][kv_idx])
         return dpo_prefix_sharing_mask & sequence_mask
 

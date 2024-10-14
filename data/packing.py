@@ -1,4 +1,3 @@
-# pylint: skip-file
 """
 Multipack Batch Sampler from axololt: https://github.com/axolotl-ai-cloud/axolotl 
 """
@@ -11,7 +10,7 @@ import numba
 import numpy as np
 from torch.utils.data import BatchSampler, Sampler
 
-LOG = logging.getLogger("axolotl.utils.samplers.multipack")
+LOG = logging.getLogger(__name__)
 
 
 @numba.njit

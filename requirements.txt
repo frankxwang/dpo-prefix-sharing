@@ -1,0 +1,11 @@
+datasets>=1.17.0
+tqdm
+# dev version of transformers with processing_class changes for Trainer
+git+https://github.com/huggingface/transformers.git@7434c0ed21a154136b0145b0245ae9058005abac
+# dev version of TRL
+git+https://github.com/huggingface/trl.git@14f3613dac011b4e2b1b17740b5ff2fc43fd150b
+deepspeed==0.15.1
+accelerate>=0.33.0
+peft>=0.3.0
+tyro>=0.5.7
+scipy

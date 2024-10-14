@@ -1,4 +1,8 @@
-"""monkey patches for the dataset fetcher to handle batches of packed indexes"""
+"""monkeypatches for the dataset fetcher to handle batches of packed indexes
+
+These patches are borrowed from axolotl: 
+https://github.com/axolotl-ai-cloud/axolotl/blob/main/src/axolotl/monkeypatch/data/batch_dataset_fetcher.py 
+"""
 # pylint: disable=protected-access
 
 import torch
@@ -46,13 +50,14 @@ def patch_torch_to_work_with_hf():
     torch.utils.data._utils.worker._worker_loop = patched_worker_loop
     patch_fetchers()
 
-def patch_hf_to_work_with_torch():
-    from datasets import Dataset
-    class MyDataset(Dataset):
-        def __getitems__(self, keys: List):
-            if isinstance(keys, list) and isinstance(keys[0], list):
-                batch = []
-                for el in keys:
-                    batch.append(self.__getitems__(el))
-                return batch
+# TODO (sumanthrh): Make this work 
+# def patch_hf_to_work_with_torch():
+#     from datasets import Dataset
+#     class MyDataset(Dataset):
+#         def __getitems__(self, keys: List):
+#             if isinstance(keys, list) and isinstance(keys[0], list):
+#                 batch = []
+#                 for el in keys:
+#                     batch.append(self.__getitems__(el))
+#                 return batch
                 
