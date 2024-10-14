@@ -1508,31 +1508,20 @@ class DPOTrainer(Trainer):
         
         return logps
     
-    def sum_between_indexes(self, tensor, indexes_start, indexes_end, with_packing: bool = False):
-        if with_packing:
-            assert indexes_start.ndim == 3
-            assert indexes_end.ndim == 3
-            assert tensor.ndim == 3
-            seqs, batch_size, sequence_length = tensor.shape
-            # Create a range tensor for each batch
-            range_tensor = torch.arange(sequence_length, device=tensor.device).expand_as(tensor)
-            mask = (indexes_start <= range_tensor) & (range_tensor < indexes_end)
-            # sum over indexes per sequence and collapse the sequence dimension
-            result = (tensor * mask.float()).sum(dim=-1).sum(dim=0)
-        else:
-            batch_size, sequence_length = tensor.shape
+    def sum_between_indexes(self, tensor, indexes_start, indexes_end):
+        batch_size, sequence_length = tensor.shape
 
-            indexes_start = indexes_start.to(tensor.device)
-            indexes_end = indexes_end.to(tensor.device)
+        indexes_start = indexes_start.to(tensor.device)
+        indexes_end = indexes_end.to(tensor.device)
 
-            # Create a range tensor for each batch
-            range_tensor = torch.arange(sequence_length, device=tensor.device).expand(batch_size, -1).to(tensor.device)
+        # Create a range tensor for each batch
+        range_tensor = torch.arange(sequence_length, device=tensor.device).expand(batch_size, -1).to(tensor.device)
 
-            # Create a mask for the range we want to sum
-            mask = (range_tensor >= indexes_start.unsqueeze(1)) & (range_tensor < indexes_end.unsqueeze(1))
+        # Create a mask for the range we want to sum
+        mask = (range_tensor >= indexes_start.unsqueeze(1)) & (range_tensor < indexes_end.unsqueeze(1))
 
-            # Apply the mask and sum
-            result = (tensor * mask.float()).sum(dim=-1)
+        # Apply the mask and sum
+        result = (tensor * mask.float()).sum(dim=-1)
 
         return result
 
@@ -1590,7 +1579,7 @@ class DPOTrainer(Trainer):
         self,
         model: nn.Module,
         batch: Dict[str, Union[List, torch.LongTensor]],
-        mode: Literal["train", "eval", "ref", "other"] = "ref",
+        mode: Literal["train", "eval", "ref", "other"] = "ref", # the mode for training. Helpful for logging decisions
     ):
         seq_len = batch["input_ids"].shape[-1]
         assert (
@@ -1669,7 +1658,8 @@ class DPOTrainer(Trainer):
             upper_bound = batch["rejected_index"].unsqueeze(1).unsqueeze(2).to(inputs_device)
             tensor = torch.arange(seq_len).unsqueeze(0).unsqueeze(2).to(inputs_device)
             rejected_mask = ~ ( (lower_bound <= tensor ) & (tensor < upper_bound)) 
-            # upcast to float32 since maskedtensor doesn't support bfloat16 yet. 
+            # upcast to float32 since maskedtensor doesn't support bfloat16 yet.
+            # TODO: confirm this is correct. At the moment it's only logged for metrics so these tensors don't matter
             chosen_logits = torch.masked.MaskedTensor(all_logits.to(torch.float32), chosen_mask.expand_as(all_logits))
             rejected_logits =  torch.masked.MaskedTensor(all_logits.to(torch.float32), rejected_mask.expand_as(all_logits))
         else:
@@ -1683,9 +1673,8 @@ class DPOTrainer(Trainer):
             chosen_logits,
             rejected_logits,
             logps_chosen.sum(),
-            all_logits, # dummy for now
-        )  # only first two matter, last three are dummy for now
-
+            None, # dummy for now
+        )
 
     def concatenated_forward(
         self, model: nn.Module, batch: Dict[str, Union[List, torch.LongTensor]]
@@ -1823,9 +1812,9 @@ class DPOTrainer(Trainer):
                             self.model, batch
                         )[:2]
                 else:
-                    reference_chosen_logps, reference_rejected_logps, _, _, _, ref_weights = forward_func(
+                    reference_chosen_logps, reference_rejected_logps = forward_func(
                         self.ref_model, batch
-                    )[:6]
+                    )[:2]
         
         losses, chosen_rewards, rejected_rewards = self.dpo_loss(
             policy_chosen_logps,
