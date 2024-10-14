@@ -23,7 +23,9 @@ from copy import deepcopy
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
+np.random.seed(0)
 import torch
+torch.manual_seed(41)
 import torch.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
@@ -142,7 +144,7 @@ def _maybe_process_batch_for_prefix_sharing(batch, indexes: List[int], chosen_to
         if args.enable_packing:
             batch["sequence_id"] = [[idx for _ in range(length)] for idx, length in zip(indexes, batch["length"]) ]
             batch["chosen_index"] = [[prompt_len - 1 for _ in range(length)] for prompt_len, length in zip(prompt_lens, batch["length"])]
-            batch["rejected_index"] = [[prompt_len + chosen_len for _ in range(length)]for prompt_len, chosen_len, length in zip(prompt_lens, chosen_lens, batch["length"])]
+            batch["rejected_index"] = [[prompt_len + chosen_len for _ in range(length)] for prompt_len, chosen_len, length in zip(prompt_lens, chosen_lens, batch["length"])]
             batch["end_index"] =[[prompt_len + chosen_len + rejected_len + 1 for _ in range(length)] for prompt_len, chosen_len, rejected_len, length in zip(prompt_lens, chosen_lens, rejected_lens, batch["length"])]
         else:
             batch["chosen_index"] = [prompt_len - 1 for prompt_len in prompt_lens]
@@ -616,7 +618,7 @@ class DPOTrainer(Trainer):
                 elif isinstance(config, MistralConfig):
                     ref_model = MistralForCausalLMFlexAttn.from_pretrained(ref_model, **ref_model_init_kwargs)
                 else:
-                    raise NotImplementedError(f"flex attention not implemented for model {model}")
+                    raise NotImplementedError(f"flex attention not implemented for model {ref_model}")
             else:
                 ref_model = AutoModelForCausalLM.from_pretrained(ref_model, **ref_model_init_kwargs)
 
@@ -1498,13 +1500,9 @@ class DPOTrainer(Trainer):
             else:
                 # first loss will be 0, is for padding
                 assert loss_seq_id[:, :-1].shape == logps.shape
-                losses = torch.zeros(torch.max(loss_seq_id) + 1, device=logps.device, dtype=logps.dtype).scatter_add_(
-                    0, loss_seq_id[:, :-1].flatten(), logps.flatten()
+                losses = torch.zeros(torch.max(loss_seq_id) + 1, device=logps.device, dtype=torch.float32).scatter_add_(
+                    0, loss_seq_id[:, :-1].flatten(), logps.flatten().to(torch.float32)
                 )
-                # if self.accelerator.is_main_process and mode:
-                #     with open("outputs.pkl", "wb") as f:
-                #         import pickle
-                #         pickle.dump({"logps": logps.detach().cpu(), "loss_seq_id": loss_seq_id, "losses": losses.detach().cpu()}, f)
                 logps_chosen, logps_rejected = losses[1:].reshape(-1, 2).T
             return logps_chosen, logps_rejected
         
@@ -1600,10 +1598,6 @@ class DPOTrainer(Trainer):
         ), f"position ids array is invalid, expected seq len {seq_len} but got array {batch['position_ids'].shape[-1]}"
         inputs_device = self.accelerator.device
 
-        # if self.accelerator.is_main_process and mode=="train":
-        #     with open("inputs.pkl", "wb") as f:
-        #         import pickle
-        #         pickle.dump(batch, f)
         with CudaTimer(device=self.accelerator.device) as fwd_timer:
             if self.args.prefix_sharing:
                 if self.args.enable_packing:
@@ -1689,7 +1683,7 @@ class DPOTrainer(Trainer):
             chosen_logits,
             rejected_logits,
             logps_chosen.sum(),
-            None, # dummy for now
+            all_logits, # dummy for now
         )  # only first two matter, last three are dummy for now
 
 
@@ -1829,13 +1823,9 @@ class DPOTrainer(Trainer):
                             self.model, batch
                         )[:2]
                 else:
-                    reference_chosen_logps, reference_rejected_logps = forward_func(
+                    reference_chosen_logps, reference_rejected_logps, _, _, _, ref_weights = forward_func(
                         self.ref_model, batch
-                    )[:2]
-        # if self.accelerator.is_main_process:
-        #     with open("final_logps.pkl", "wb") as f:
-        #         import pickle
-        #         pickle.dump([policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps], f)
+                    )[:6]
         
         losses, chosen_rewards, rejected_rewards = self.dpo_loss(
             policy_chosen_logps,
@@ -1843,8 +1833,7 @@ class DPOTrainer(Trainer):
             reference_chosen_logps,
             reference_rejected_logps,
         )
-        # print(losses)
-        # exit()
+
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
         if self.args.rpo_alpha is not None:
