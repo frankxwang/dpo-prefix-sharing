@@ -132,7 +132,6 @@ class LlamaForCausalLMFlexAttn(LlamaForCausalLM):
         input_tensor: torch.Tensor,
         cache_position: torch.Tensor,
         past_key_values: Cache,
-        use_cache: bool,
         output_attentions: bool,
     ):
         return attention_mask
