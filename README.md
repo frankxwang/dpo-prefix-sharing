@@ -10,7 +10,6 @@ Contains code to reproduce our work "Accelerating Direct Preference Optimization
 Installation instructions: 
 - Python 3.10+
 - CUDA 12.3 or above
-- PyTorch 2.5.0+ (As of Sept 15th 2024, PyTorch 2.5.0 is avaiable in the [test channel](https://dev-discuss.pytorch.org/t/pytorch-2-5-release-branch-cut-for-pytorch-core-is-completed/2452/1))
 - `pip install -r requirements.txt`
 
 ## Launch training

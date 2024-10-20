@@ -89,11 +89,3 @@ if __name__ == "__main__":
     )
 
     trainer.train()
-    # metrics = trainer.evaluate()
-    # trainer.log_metrics("eval", metrics)
-    # trainer.save_metrics("eval", metrics)
-
-    # # Save and push to hub
-    # trainer.save_model(training_args.output_dir)
-    # if training_args.push_to_hub:
-    #     trainer.push_to_hub(dataset_name=script_args.dataset_name)
