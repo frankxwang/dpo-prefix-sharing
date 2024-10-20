@@ -9,3 +9,4 @@ accelerate>=0.33.0
 peft>=0.3.0
 tyro>=0.5.7
 scipy
+numba
