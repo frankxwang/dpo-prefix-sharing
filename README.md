@@ -13,9 +13,9 @@ Each [DPO](https://arxiv.org/abs/2305.18290) training example consists of a shar
 
 To implement the custom attention mask, we use PyTorch's [FlexAttention](https://pytorch.org/blog/flexattention/) and leverage its block sparsity to skip empty blocks of the attention mask.
 
-Our method works best when the prompt prefixes are much longer than the responses, such as for tasks like multiturn chat or summarization. For instance, on the [Anthropic HH-RLHF](https://huggingface.co/datasets/Anthropic/hh-rlhf) multiturn dataset, FlexAttention w/ prefix sharing & sequence packing outperforms FlashAttention-3 w/ sequence packing **by a factor of 1.41×**. Still, even for the [UltraFeedback](https://huggingface.co/datasets/HuggingFaceH4/ultrafeedback_binarized) dataset, where the responses are usually longer than the prompts, we get speedups of 1.17×.
+Our method works best when the prompt prefixes are much longer than the responses, such as for tasks like multiturn chat or summarization. For instance, on the [Anthropic HH-RLHF](https://huggingface.co/datasets/Anthropic/hh-rlhf) multiturn dataset, FlexAttention w/ prefix sharing & sequence packing is faster than FlashAttention-3 w/ sequence packing **by a factor of 1.41×**. Nevertheless, even for the [UltraFeedback](https://huggingface.co/datasets/HuggingFaceH4/ultrafeedback_binarized) dataset, where the responses are much longer than the prompt prefixes, we get a speedup of 1.17×.
 
-For more performance improvement statistics across other datasets see our paper or the [Speedups](#speedups) section.
+For more performance improvement statistics across other datasets, see our paper or the [Speedups](#speedups) section.
 
 ## Get Started
 Installation instructions: 
@@ -25,7 +25,7 @@ Installation instructions:
 - `pip install -r requirements.txt`
 
 ## Launch training
-Our trainer is based on the DPO Trainer from 🤗TRL, and thus you can run training as you would for a typical DPO run. We further enable prefix sharing and sequence packing with the flags `--prefix_sharing` and `--enable_packing`. Some example commands are provided below for the [Capybara dataset](https://huggingface.co/datasets/argilla/distilabel-capybara-dpo-7k-binarized). We've implemented support for Mistral and Llama 3 models.
+Our trainer is based on the DPO Trainer from 🤗TRL, and thus you can run training as you would for a typical DPO run. We further enable prefix sharing and sequence packing with the flags `--prefix_sharing` and `--enable_packing`. Some example commands are provided below for the [Capybara dataset](https://huggingface.co/datasets/argilla/distilabel-capybara-dpo-7k-binarized). We've implemented support for the Mistral and Llama 3 models.
 
 ### Prefix sharing
 
@@ -50,18 +50,35 @@ To reproduce the results from our paper for Capybara, you use run: `bash benchma
 
 ## Speedups
 
-Our method works best when the data has prompt prefixes that are longer than the completions. Below we show prefix sharing's speedups _without sample packing_.
+Note: These experiments were run on an 8xH100 setup, but we expect similar improvements for A100s.
+
+Below we show prefix sharing's speedups _without sample packing_. Overall, our approach does best when the dataset has a high prefix-to-completion ratio and a high overall sequence length.
 
 <div align="center">
 
 | Dataset  | Median<br/>Overall<br/>Length | Median<br/>Prefix to Completion<br/>Length Ratio | FlashAttn-3<br/>(samples/sec) | Flex Attn<br/>(samples/sec) | Flex Attn + Prefix Sharing<br/>(samp/sec, (speedup over FA3 & Flex)) |
 |---------:|:--------------------:|:---------------------:|:----:|:-----:|:----------------:|
 | [Capybara](https://huggingface.co/datasets/LDJnr/Capybara)  | 1160  | 1.59 | 8.38 | 7.75 | 11.90 (1.42×, 1.54×)     |
-| [HH-RLHF](https://huggingface.co/datasets/trl-internal-testing/hh-rlhf-trl-style) | 186 | 2.15 | 33.71| 30.25 | 36.11 (1.07×, 1.19×) |
+| [HH-RLHF](https://huggingface.co/datasets/trl-internal-testing/hh-rlhf-trl-style) | 186 | 2.15 | 33.71 | 30.25 | 36.11 (1.07×, 1.19×) |
 | [MetaMath-DPO](https://huggingface.co/datasets/abacusai/MetaMath_DPO_FewShot) | 872 | 3.91 | 13.86| 13.02 | 19.13 (1.38×, 1.47×) |
 | [TLDR](https://huggingface.co/datasets/trl-internal-testing/tldr-preference-trl-style) | 416 | 11.14 | 31.43 | 29.53 | 35.36 (1.12×, 1.20×) |
 | [Tulu-Helpsteer](https://huggingface.co/datasets/allenai/tulu-2.5-preference-data/viewer/default/helpsteer) | 775 | 6.34 | 14.83 | 13.93      | 21.75 (1.47×, 1.56×) |
 | [Ultrafeedback](https://huggingface.co/datasets/HuggingFaceH4/ultrafeedback_binarized) | 409 | 0.42 | 18.40| 17.31 | 20.46 (1.11×, 1.18×)     |
+
+</div>
+
+When combined with sample packing, prefix sharing has more consistent speedups for datasets with shorter overall sequence lengths (HH-RLHF: 1.07× => 1.41×, TLDR: 1.12× => 1.35×). Sequence packing is also generally much more efficient than the non-packing implementation (can sometimes lead to up to 5× speedups).
+
+<div align="center">
+
+| Dataset  | Median<br/>Overall<br/>Length | Median<br/>Prefix to Completion<br/>Length Ratio | FlashAttn-3<br/>(samples/sec) | Flex Attn<br/>(samples/sec) | Flex Attn + Prefix Sharing<br/>(samp/sec, (speedup over FA3 & Flex)) |
+|---------:|:--------------------:|:---------------------:|:----:|:-----:|:----------------:|
+| [Capybara](https://huggingface.co/datasets/LDJnr/Capybara)  | 1160  | 1.59 | 17.89 | 17.63 | 23.89 (1.34×, 1.36×)     |
+| [HH-RLHF](https://huggingface.co/datasets/trl-internal-testing/hh-rlhf-trl-style) | 186 | 2.15 | 109.77 | 104.99 | 155.04 (1.41×, 1.48×) |
+| [MetaMath-DPO](https://huggingface.co/datasets/abacusai/MetaMath_DPO_FewShot) | 872 | 3.91 | 24.21| 23.83 | 38.07 (1.57×, 1.60×) |
+| [TLDR](https://huggingface.co/datasets/trl-internal-testing/tldr-preference-trl-style) | 416 | 11.14 | 44.11 | 43.22 | 59.76 (1.35×, 1.38×) |
+| [Tulu-Helpsteer](https://huggingface.co/datasets/allenai/tulu-2.5-preference-data/viewer/default/helpsteer) | 775 | 6.34 | 29.85 | 28.98 | 44.10 (1.48×, 1.52×) |
+| [Ultrafeedback](https://huggingface.co/datasets/HuggingFaceH4/ultrafeedback_binarized) | 409 | 0.42 | 45.46| 44.13 | 53.21 (1.17×, 1.21×)     |
 
 </div>
 
