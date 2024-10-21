@@ -93,6 +93,7 @@ if __name__ == "__main__":
     )
 
     trainer.train()
+
     metrics = trainer.evaluate()
     trainer.log_metrics("eval", metrics)
     trainer.save_metrics("eval", metrics)
