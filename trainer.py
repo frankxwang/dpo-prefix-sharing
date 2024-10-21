@@ -501,7 +501,7 @@ class DPOTrainer(Trainer):
                 warnings.warn(
                     "`packing_length` not provided, setting to 2*`max_length`"
                 )
-            args.packing_length = 2 * args.max_length
+                args.packing_length = 2 * args.max_length
 
         if model_init_kwargs is not None:
             warnings.warn(
