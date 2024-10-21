@@ -90,8 +90,9 @@ When combined with sample packing, prefix sharing has more consistent speedups f
 
 ## Acknowledgements
 
-Our code is based off of 🤗TRL - https://github.com/huggingface/trl. The sampler implementation is from Axolotl https://github.com/axolotl-ai-cloud/axolotl which is a more distributed training friendly version of https://github.com/imoneoi/multipack_sampler
-We also make use of FlexAttention 
+Our code is based off of [🤗TRL](https://github.com/huggingface/trl). The packing sampler implementation is from [Axolotl](https://github.com/axolotl-ai-cloud/axolotl), which is a more distributed training friendly version of the [Multipack Sampler](https://github.com/imoneoi/multipack_sampler).
+
+We also make use of [FlexAttention](https://pytorch.org/blog/flexattention/) for the custom attention mask implementation.
 
 ## Citation
 
