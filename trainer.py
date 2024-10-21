@@ -90,43 +90,6 @@ if is_deepspeed_available():
     import deepspeed
 
 
-
-# batch is a misnomer this is just a row
-# batch = {
-#     k: chosen_tokens[f"prompt_{k}"]
-#     + chosen_tokens[k]
-#     + chosen_tokens[f"prompt_{k}"][-1:]
-#     + rejected_tokens[k]
-#     for k in ["input_ids", "attention_mask"]
-# }
-# prompt_len = len(chosen_tokens["prompt_input_ids"])
-# chosen_len = len(chosen_tokens["input_ids"])
-# rejected_len = len(rejected_tokens["input_ids"])
-# # we need to ignore the last chosen token
-# batch["labels"] = (
-#     [self.label_pad_token_id] * prompt_len
-#     + chosen_tokens["input_ids"]
-#     + [self.label_pad_token_id]
-#     + rejected_tokens["input_ids"]
-# )
-# batch["length"] = len(batch["input_ids"])
-# if self.args.enable_packing:
-#     batch["sequence_id"] = [idx for _ in range(batch["length"])]
-#     batch["chosen_index"] = [prompt_len - 1 for _ in range(batch["length"])]
-#     batch["rejected_index"] = [prompt_len + chosen_len for _ in range(batch["length"])]
-#     batch["end_index"] = [prompt_len + chosen_len + rejected_len + 1 for _ in range(batch["length"])]
-# else:
-#     batch["sequence_id"] = idx
-#     # the chosen index starts from the final prompt token
-#     batch["chosen_index"] = prompt_len - 1
-#     batch["rejected_index"] = prompt_len + chosen_len
-#     # the end index needs an extra +1 for the extra final prompt token
-#     batch["end_index"] = prompt_len + chosen_len + rejected_len + 1
-# # for the rejected sequence, we start from the final prompt token
-# batch["position_ids"] = list(range(prompt_len + chosen_len)) + list(
-#     range(prompt_len - 1, prompt_len + rejected_len)
-# )
-
 def _maybe_process_batch_for_prefix_sharing(batch, indexes: List[int], chosen_tokens, rejected_tokens, args):
     if args.prefix_sharing:
         for k in ['input_ids', 'attention_mask']:
@@ -968,8 +931,8 @@ class DPOTrainer(Trainer):
                 eval_dataset = eval_dataset.map(
                     _tokenize,
                     fn_kwargs=fn_kwargs,
-                    with_indices=True,
                     batched=True,
+                    with_indices=True,
                     num_proc=self.dataset_num_proc,
                     writer_batch_size=10,
                     desc="Tokenizing eval dataset",
@@ -1176,6 +1139,24 @@ class DPOTrainer(Trainer):
             if self.eval_dataset is not None:
                 self.eval_dataset = eval_dataset
             self._precomputed_eval_ref_log_probs = True
+        
+        if self.args.enable_packing:
+            assert self.args.packing_length is not None, "max_length must be provided for packing"
+            dataloader_params = {
+                "collate_fn": self.data_collator,
+                "num_workers": self.args.dataloader_num_workers,
+                "pin_memory": self.args.dataloader_pin_memory,
+            }
+            sampler = MultipackBatchSampler(
+                sampler=RandomSampler(self.eval_dataset),
+                batch_size=self.args.per_device_eval_batch_size,
+                lengths=np.array(self.eval_dataset["length"]),
+                batch_max_len=self.args.packing_length,
+            )
+            dataloader_params["batch_sampler"] = sampler
+            # prepare dataloader
+            data_loader = self.accelerator.prepare(DataLoader(self.eval_dataset, **dataloader_params))
+            return data_loader
 
         return super().get_eval_dataloader(eval_dataset=eval_dataset)
 

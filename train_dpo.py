@@ -29,6 +29,9 @@ if __name__ == "__main__":
     quantization_config = get_quantization_config(model_config)
     if training_args.prefix_sharing:
         assert model_config.attn_implementation == "flex_attention", "Must set --attn_implementation=flex_attention for prefix sharing attention mask support"
+    if model_config.attn_implementation == "flex_attention":
+        # because of compilation, batch sizes need to match so we don't trigger a recompilation
+        assert training_args.per_device_eval_batch_size == training_args.per_device_train_batch_size, "Must have equal train and eval batch sizes for FlexAttention support"
     model_kwargs = dict(
         revision=model_config.model_revision,
         attn_implementation=model_config.attn_implementation,
@@ -89,11 +92,11 @@ if __name__ == "__main__":
     )
 
     trainer.train()
-    # metrics = trainer.evaluate()
-    # trainer.log_metrics("eval", metrics)
-    # trainer.save_metrics("eval", metrics)
+    metrics = trainer.evaluate()
+    trainer.log_metrics("eval", metrics)
+    trainer.save_metrics("eval", metrics)
 
-    # # Save and push to hub
-    # trainer.save_model(training_args.output_dir)
-    # if training_args.push_to_hub:
-    #     trainer.push_to_hub(dataset_name=script_args.dataset_name)
+    # Save and push to hub
+    trainer.save_model(training_args.output_dir)
+    if training_args.push_to_hub:
+        trainer.push_to_hub(dataset_name=script_args.dataset_name)
