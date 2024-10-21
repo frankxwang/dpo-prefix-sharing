@@ -20,8 +20,8 @@ For more performance improvement statistics across other datasets see our paper 
 ## Get Started
 Installation instructions: 
 - Python 3.10+
-- CUDA 12.3 or above
-- PyTorch 2.5.0+
+- CUDA 12.1 or above
+- PyTorch 2.5.0
 - `pip install -r requirements.txt`
 
 ## Launch training

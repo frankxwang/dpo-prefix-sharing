@@ -1,3 +1,4 @@
+torch==2.5.0
 datasets>=1.17.0
 tqdm
 # dev version of transformers with processing_class changes for Trainer
