@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Literal, Optional, List
 
 from transformers import TrainingArguments
 
@@ -193,3 +193,23 @@ class DPOConfig(TrainingArguments):
                 self.max_completion_length = self.max_target_length
 
         return super().__post_init__()
+
+@dataclass
+class DPOScriptArguments:
+    dataset_name: str = field(default=None, metadata={"help": "the dataset name"})
+    keep_columns: Optional[List[str]] = field(default=None, metadata={"help": "if specified, which columns of the dataset to use"})
+    dataset_train_split: str = field(default="train", metadata={"help": "The dataset split to use for training"})
+    dataset_test_split: str = field(default="test", metadata={"help": "The dataset split to use for evaluation"})
+    ignore_bias_buffers: bool = field(
+        default=False,
+        metadata={
+            "help": "debug argument for distributed training;"
+            "fix for DDP issues with LM bias/mask buffers - invalid scalar type,`inplace operation. See"
+            "https://github.com/huggingface/transformers/issues/22482#issuecomment-1595790992"
+        },
+    )
+    config: str = field(default=None, metadata={"help": "Path to the optional config file"})
+    gradient_checkpointing_use_reentrant: bool = field(
+        default=False,
+        metadata={"help": "Whether to apply `use_reentrant` for gradient_checkpointing"},
+    )

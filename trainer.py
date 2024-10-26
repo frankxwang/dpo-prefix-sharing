@@ -1446,10 +1446,9 @@ class DPOTrainer(Trainer):
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
-        chosen_indexes=None,
-        rejected_indexes=None,
-        loss_seq_id=None,
-        mode =None,
+        chosen_indexes: Optional[torch.Tensor] = None,
+        rejected_indexes: Optional[torch.Tensor] = None,
+        loss_seq_id: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute the log probabilities of the given labels under the given logits.
@@ -1457,10 +1456,15 @@ class DPOTrainer(Trainer):
         Args:
             logits: Logits of the model (unnormalized). Shape: (batch_size, sequence_length, vocab_size)
             labels: Labels for which to compute the log probabilities. Label tokens with a value of label_pad_token_id are ignored. Shape: (batch_size, sequence_length)
-            label_pad_token_id: The label pad token id.
-            is_encoder_decoder: Whether the model is an encoder-decoder model.
-            use_weighting: Whether to apply weighting as done in the [WPO](https://huggingface.co/papers/2406.11827) paper.
-
+            chosen_indexes: The start indices of the chosen response (ignored if loss_seq_id is provided)
+            rejected_indexes: The start indices of the rejected response (ignored if loss_seq_id is provided)
+            loss_seq_id: If sample packing is enabled, contains the index of each response (as a dense batch_size x seq_length array) such that:
+                padding tokens => index 0
+                (chosen response #1) => index 1
+                (rejected response #1) => index 2
+                (chosen response #2) => index 3
+                (rejected response #2) => index 4
+                etc ...
         Returns
             A tensor of shape (batch_size,) containing the sum of log probabilities of the given labels under the given logits.
         """
@@ -1468,26 +1472,24 @@ class DPOTrainer(Trainer):
         loss_fct = nn.CrossEntropyLoss(ignore_index=self.label_pad_token_id, reduction="none")
 
         logps = -loss_fct(logits.permute(0, 2, 1)[..., :-1], labels[..., 1:])
-        if chosen_indexes is None or rejected_indexes is None:
-            logps = logps.sum(dim=-1)
-        else:
-            if loss_seq_id is None:
-                logps_chosen = self.sum_between_indexes(
-                    logps, chosen_indexes, rejected_indexes - 1
-                )  # the last prediction needs to be removed since that label is in the rejected message
-                logps_rejected = self.sum_between_indexes(
-                    logps, rejected_indexes, torch.ones(len(rejected_indexes)) * 100000
-                )
-            else:
-                # first loss will be 0, is for padding
-                assert loss_seq_id[:, :-1].shape == logps.shape
-                losses = torch.zeros(torch.max(loss_seq_id) + 1, device=logps.device, dtype=torch.float32).scatter_add_(
-                    0, loss_seq_id[:, :-1].flatten(), logps.flatten().to(torch.float32)
-                )
-                logps_chosen, logps_rejected = losses[1:].reshape(-1, 2).T
-            return logps_chosen, logps_rejected
-        
-        return logps
+
+        if loss_seq_id is None: # if not using sequence packing
+            logps_chosen = self.sum_between_indexes(
+                logps, chosen_indexes, rejected_indexes - 1
+            )  # the last prediction needs to be removed since that label is in the rejected message
+            logps_rejected = self.sum_between_indexes(
+                logps, rejected_indexes, torch.ones(len(rejected_indexes)) * 100000
+            )
+        else: # scatter_add operation for sequence packing loss calculation
+            # first loss will be 0, is for padding
+            assert loss_seq_id[:, :-1].shape == logps.shape
+            # torch.float32 is necessary for correct accumulation
+            losses = torch.zeros(torch.max(loss_seq_id) + 1, device=logps.device, dtype=torch.float32).scatter_add_(
+                0, loss_seq_id[:, :-1].flatten(), logps.flatten().to(torch.float32)
+            )
+            logps_chosen, logps_rejected = losses[1:].reshape(-1, 2).T
+
+        return logps_chosen, logps_rejected
     
     def sum_between_indexes(self, tensor, indexes_start, indexes_end):
         batch_size, sequence_length = tensor.shape
@@ -1626,35 +1628,23 @@ class DPOTrainer(Trainer):
                 chosen_indexes=batch["chosen_index"].to(inputs_device),
                 rejected_indexes=batch["rejected_index"].to(inputs_device),
                 loss_seq_id=batch["loss_seq_id"].to(inputs_device) if "loss_seq_id" in batch else None,
-                mode="train" if mode=="train" else None,
             )
         logps_time = logps_timer.elapsed_time
         if mode == "train":
             # don't use dpoTrainer's .log because it is shit
             super().log({f"{mode}_logps_time": logps_time / 1e3})
 
-        if not self.args.enable_packing:
-            chosen_mask = torch.arange(seq_len).unsqueeze(0).unsqueeze(2).to(inputs_device) < batch["chosen_index"].unsqueeze(1).unsqueeze(2)
-            lower_bound = batch["chosen_index"].unsqueeze(1).unsqueeze(2).to(inputs_device)
-            upper_bound = batch["rejected_index"].unsqueeze(1).unsqueeze(2).to(inputs_device)
-            tensor = torch.arange(seq_len).unsqueeze(0).unsqueeze(2).to(inputs_device)
-            rejected_mask = ~ ( (lower_bound <= tensor ) & (tensor < upper_bound)) 
-            # upcast to float32 since maskedtensor doesn't support bfloat16 yet.
-            # TODO: confirm this is correct. At the moment it's only logged for metrics so these tensors don't matter
-            chosen_logits = torch.masked.MaskedTensor(all_logits.to(torch.float32), chosen_mask.expand_as(all_logits))
-            rejected_logits =  torch.masked.MaskedTensor(all_logits.to(torch.float32), rejected_mask.expand_as(all_logits))
-        else:
-            # NOTE: dummy logits when packing is enabled since there are just used for logging.
-            chosen_logits = torch.zeros(1)
-            rejected_logits = torch.zeros(1)
+        if self.use_weighting or self.args.rpo_alpha is not None:
+            raise NotImplementedError
 
+        # currently, we only implement logps calculation, the nll, logits, and weights are unnecessary for DPO
         return (
             logps_chosen,
             logps_rejected,
-            chosen_logits,
-            rejected_logits,
-            logps_chosen.sum(),
-            None, # dummy for now
+            None,
+            None,
+            None,
+            None,
         )
 
     def concatenated_forward(
@@ -1819,10 +1809,10 @@ class DPOTrainer(Trainer):
         metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean().cpu()
         metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean().cpu()
         metrics[f"{prefix}logps/rejected"] = policy_rejected_logps.detach().mean().cpu()
-        metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().mean().cpu() 
-        # Use .item explicitly since we use MaskedTensor for prefix sharing
-        metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.detach().mean().cpu().item()
-        metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu().item()
+        metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().mean().cpu()
+        if policy_rejected_logits is not None and policy_chosen_logits is not None:
+            metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.detach().mean().cpu()
+            metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu()
         if self.args.rpo_alpha is not None:
             metrics[f"{prefix}nll_loss"] = policy_nll_loss.detach().mean().cpu()
 

@@ -1,5 +1,3 @@
-from trl.commands.cli_utils import DPOScriptArguments, TrlParser
-
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
@@ -9,9 +7,10 @@ from trl import (
     get_peft_config,
     get_quantization_config,
 )
+from trl.commands.cli_utils import TrlParser
 from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 from trainer import DPOTrainer
-from config import DPOConfig
+from config import DPOConfig, DPOScriptArguments
 
 if __name__ == "__main__":
     parser = TrlParser((DPOScriptArguments, DPOConfig, ModelConfig))
@@ -70,6 +69,11 @@ if __name__ == "__main__":
     else:
         eval_dataset = None
 
+    if script_args.keep_columns:
+        train_dataset = train_dataset.select_columns(script_args.keep_columns)
+        if eval_dataset is not None:
+            eval_dataset = eval_dataset.select_columns(script_args.keep_columns)
+
     if training_args.max_train_samples and training_args.max_train_samples < len(train_dataset):
         train_dataset = train_dataset.select(range(training_args.max_train_samples))
     
@@ -94,9 +98,10 @@ if __name__ == "__main__":
 
     trainer.train()
 
-    metrics = trainer.evaluate()
-    trainer.log_metrics("eval", metrics)
-    trainer.save_metrics("eval", metrics)
+    if eval_dataset is not None:
+        metrics = trainer.evaluate()
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
 
     # Save and push to hub
     trainer.save_model(training_args.output_dir)
