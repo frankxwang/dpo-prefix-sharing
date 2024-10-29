@@ -100,11 +100,11 @@ If you find our work useful, please cite
 
 ```
 @inproceedings{
-wang2024accelerating,
-title={Accelerating Direct Preference Optimization with Prefix Sharing},
-author={Franklin Wang and Sumanth Hegde},
-booktitle={NeurIPS 2024 Workshop on Fine-Tuning in Modern Machine Learning: Principles and Scalability},
-year={2024},
-url={https://openreview.net/forum?id=d4dRhZiTdm}
+  wang2024accelerating,
+  title={Accelerating Direct Preference Optimization with Prefix Sharing},
+  author={Franklin Wang and Sumanth Hegde},
+  booktitle={NeurIPS 2024 Workshop on Fine-Tuning in Modern Machine Learning: Principles and Scalability},
+  year={2024},
+  url={https://openreview.net/forum?id=d4dRhZiTdm}
 }
 ```
