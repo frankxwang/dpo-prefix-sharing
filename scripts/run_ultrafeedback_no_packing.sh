@@ -5,7 +5,7 @@ max_prompt_length=512
 batch_size=4
 output_dir="ultrafeedback_no_packing"
 
-accelerate launch --config_file 'configs/zero3.yaml'  train_dpo.py \
+accelerate launch --config_file 'configs/zero3.yaml' train_dpo.py \
   --dataset_name=$dataset \
   --model_name_or_path=$model \
   --per_device_train_batch_size $batch_size \
