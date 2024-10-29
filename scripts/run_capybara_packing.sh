@@ -1,5 +1,5 @@
 dataset="argilla/distilabel-capybara-dpo-7k-binarized" 
-model="mistralai/Mistral-7B-Instruct-v0.1"
+model="meta-llama/Meta-Llama-3.1-8B-Instruct"
 max_length=2842
 max_prompt_length=2180
 packing_length=3968
