@@ -25,23 +25,72 @@ Installation instructions:
 - `pip install -r requirements.txt`
 
 ## Launch training
-Our trainer is based on the DPO Trainer from 🤗TRL, and thus you can run training as you would for a typical DPO run. We further enable prefix sharing and sequence packing with the flags `--prefix_sharing` and `--enable_packing`. Some example commands are provided below for the [Capybara dataset](https://huggingface.co/datasets/argilla/distilabel-capybara-dpo-7k-binarized). We've implemented support for the Mistral and Llama 3 models.
+Our trainer is based on the DPO Trainer from 🤗TRL, and thus you can run training as you would for a typical DPO run. We further enable prefix sharing and sequence packing with the flags `--attn_implementation flex_attention`, `--prefix_sharing`, `--enable_packing`, and `--packing_length ...`. Some example commands are provided below for the [Capybara dataset](https://huggingface.co/datasets/argilla/distilabel-capybara-dpo-7k-binarized). We've implemented support for the Mistral and Llama 3 models.
 
-### Prefix sharing
+### Prefix sharing example
 
-For running training for `meta-llama/Meta-Llama-3-8B-Instruct` with prefix sharing: 
+For running training for `meta-llama/Meta-Llama-3.1-8B-Instruct` with prefix sharing, use `--attn_implementation flex_attention` and `--prefix_sharing`:
 ```
-accelerate launch --config_file 'configs/zero3.yaml'  train_dpo.py  --dataset_name=argilla/distilabel-capybara-dpo-7k-binarized --model_name_or_path=meta-llama/Meta-Llama-3-8B-Instruct --per_device_train_batch_size 2 --learning_rate 1e-6 --gradient_accumulation_steps 1 --logging_steps 10 --eval_steps 500 --warmup_steps 20 --bf16 --logging_first_step --no_remove_unused_columns --output_dir --max_prompt_length 2180 --max_length 2842 --gradient_checkpointing True --save_strategy no --dataset_test_split test --dataset_train_split train --num_train_epochs 1 --dataloader_num_workers 4 --attn_implementation flex_attention --prefix_sharing 
+accelerate launch --config_file 'configs/zero3.yaml' train_dpo.py \
+  --dataset_name='argilla/distilabel-capybara-dpo-7k-binarized' \
+  --model_name_or_path='meta-llama/Meta-Llama-3.1-8B-Instruct' \
+  --per_device_train_batch_size 2 \
+  --per_device_eval_batch_size 2 \
+  --beta 0.1 \
+  --learning_rate 1e-6 \
+  --gradient_accumulation_steps 1 \
+  --logging_steps 10 \
+  --warmup_ratio 0.1 \
+  --bf16 \
+  --logging_first_step \
+  --no_remove_unused_columns \
+  --output_dir capybara_no_packing \
+  --max_prompt_length 2180 \
+  --max_length 2842 \
+  --gradient_checkpointing True \
+  --save_strategy no \
+  --dataset_train_split train \
+  --num_train_epochs 1 \
+  --dataloader_num_workers 4 \
+  --dataset_num_proc 8 \
+  --attn_implementation flex_attention \
+  --prefix_sharing
 ```
 Optionally, add reporting flags `--report_to wandb --run_name <my_run>` for WandB, etc
 
 NOTE: The current training config assumes training on a 8xA100 or a 8xH100 node. Tweak as needed for your setup. 
 
-### Prefix sharing with sequence packing
+### Prefix sharing with sequence packing example
 
+For prefix sharing and sequence packing, use `--attn_implementation flex_attention`, `--prefix_sharing`, `--enable_packing`, and `--packing_length {PACKING_LENGTH}`:
 Run:
 ```
-accelerate launch --config_file 'configs/zero3.yaml'  train_dpo.py  --dataset_name=argilla/distilabel-capybara-dpo-7k-binarized --model_name_or_path=meta-llama/Meta-Llama-3-8B-Instruct --per_device_train_batch_size 1 --learning_rate 1e-6 --gradient_accumulation_steps 1 --logging_steps 10 --eval_steps 500 --warmup_steps 20 --bf16 --logging_first_step --no_remove_unused_columns --output_dir outputs --max_prompt_length 2180 --max_length 2842 --gradient_checkpointing True --save_strategy no --dataset_test_split test --dataset_train_split train --num_train_epochs 1 --dataloader_num_workers 4 --attn_implementation flex_attention --prefix_sharing --enable_packing --packing_length 7936
+accelerate launch --config_file 'configs/zero3.yaml' train_dpo.py \
+  --dataset_name='argilla/distilabel-capybara-dpo-7k-binarized' \
+  --model_name_or_path='meta-llama/Meta-Llama-3.1-8B-Instruct' \
+  --per_device_train_batch_size 1 \
+  --per_device_eval_batch_size 1 \
+  --beta 0.1 \
+  --learning_rate 1e-6 \
+  --gradient_accumulation_steps 1 \
+  --logging_steps 10 \
+  --warmup_ratio 0.1 \
+  --bf16 \
+  --logging_first_step \
+  --no_remove_unused_columns \
+  --output_dir capybara_packing \
+  --max_prompt_length 2180 \
+  --max_length 2842 \
+  --gradient_checkpointing True \
+  --save_strategy no \
+  --dataset_train_split train \
+  --num_train_epochs 1 \
+  --dataloader_num_workers 4 \
+  --dataset_num_proc 8 \
+  --attn_implementation flex_attention \
+  --prefix_sharing \
+  --enable_packing \
+  --packing_length 7936
 ```
 
 NOTE: We calculate the "packing length" based on statistics for prefix shared inputs. In the case of Capybara, we choose a packing length of 3968 (calculated as $1.1 \times 95^{th}$ percentile of sequence lengths) and multiply by desired batch size per device (2) to get 7936. Internally, we pad all sequences (including packed sequences) to a multiple of 128 to work nicely with flex attention. 
