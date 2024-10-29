@@ -2,7 +2,7 @@
 
 ### TLDR: Use ✨prefix sharing✨ to accelerate DPO training with <ins>zero compromises on accuracy</ins>!
 
-This repo contains code to reproduce our work "Accelerating Direct Preference Optimization with Prefix Sharing", NeurIPS-FITML Workshop, 2024. [Paper link]
+This repo contains code to reproduce our work "Accelerating Direct Preference Optimization with Prefix Sharing", NeurIPS-FITML Workshop, 2024. [Arxiv Link](https://arxiv.org/abs/2410.20305)
 
 ## How does it work?
 Each [DPO](https://arxiv.org/abs/2305.18290) training example consists of a shared prompt, a "chosen" response, and a "rejected" response. Instead of computing the shared prompt twice, we combine the prompt and pair of responses into a single sequence, using a custom attention mask to share the prefix across the responses. This approach lets us speed up DPO training while being _numerically identical to standard DPO training_.
