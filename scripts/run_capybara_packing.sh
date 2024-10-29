@@ -6,7 +6,7 @@ packing_length=3968
 batch_size=2
 output_dir="capybara_packing"
 
-accelerate launch --config_file 'configs/zero3.yaml'  train_dpo.py \
+accelerate launch --config_file 'configs/zero3.yaml' train_dpo.py \
   --dataset_name=$dataset \
   --model_name_or_path=$model \
   --per_device_train_batch_size 1 \
