@@ -9,7 +9,6 @@ from transformers.models.llama.modeling_llama import (
     LlamaModel,
     LLAMA_ATTENTION_CLASSES,
     apply_rotary_pos_emb,
-    repeat_kv
 )
 from transformers.utils import logging
 

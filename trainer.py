@@ -70,7 +70,7 @@ from trl.data_utils import maybe_extract_prompt
 
 from data.utils import maybe_apply_chat_template
 from data.collators import DPOPrefixSharingPackedDataCollatorWithPadding, DPOPrefixSharingDataCollatorWithPadding
-from modeling.dpo_flex_attn_masks import construct_dpo_mask, construct_dpo_mask_with_packing
+from modeling.dpo_flex_attn_masks import get_causal_mask, get_packing_mask, get_tree_mask, construct_flex_mask
 from benchmark.utils import CudaTimer
 from config import DPOConfig, FDivergenceConstants, FDivergenceType
 from modeling.llama_patches import LlamaForCausalLMFlexAttn 
@@ -895,48 +895,48 @@ class DPOTrainer(Trainer):
             args.dataset_num_proc = dataset_num_proc
         self.dataset_num_proc = args.dataset_num_proc
 
-        # Compute that only on the main process for faster data processing.
-        # see: https://github.com/huggingface/trl/pull/1255
-        with PartialState().local_main_process_first():
-            # Extract the prompt if needed, and apply the chat template if needed
-            train_dataset = train_dataset.map(maybe_extract_prompt, num_proc=args.dataset_num_proc)
-            train_dataset = train_dataset.map(
-                maybe_apply_chat_template, fn_kwargs={"tokenizer": processing_class}, num_proc=args.dataset_num_proc
-            )
-            if eval_dataset is not None:
-                eval_dataset = eval_dataset.map(maybe_extract_prompt, num_proc=args.dataset_num_proc)
-                eval_dataset = eval_dataset.map(
-                    maybe_apply_chat_template,
-                    fn_kwargs={"tokenizer": processing_class},
-                    num_proc=args.dataset_num_proc,
-                )
+        # # Compute that only on the main process for faster data processing.
+        # # see: https://github.com/huggingface/trl/pull/1255
+        # with PartialState().local_main_process_first():
+        #     # Extract the prompt if needed, and apply the chat template if needed
+        #     train_dataset = train_dataset.map(maybe_extract_prompt, num_proc=args.dataset_num_proc)
+        #     train_dataset = train_dataset.map(
+        #         maybe_apply_chat_template, fn_kwargs={"tokenizer": processing_class}, num_proc=args.dataset_num_proc
+        #     )
+        #     if eval_dataset is not None:
+        #         eval_dataset = eval_dataset.map(maybe_extract_prompt, num_proc=args.dataset_num_proc)
+        #         eval_dataset = eval_dataset.map(
+        #             maybe_apply_chat_template,
+        #             fn_kwargs={"tokenizer": processing_class},
+        #             num_proc=args.dataset_num_proc,
+        #         )
 
-            # tokenize the dataset, lower writer batch size to avoid OOM (frequent in vision models)
-            fn_kwargs = {
-                "tokenizer": self.processing_class,
-                "args": args,
-                "processor": self.processor if self.is_vision_model else None,
-                "model": model if self.is_encoder_decoder else None,
-            }
-            train_dataset = train_dataset.map(
-                _tokenize,
-                fn_kwargs=fn_kwargs,
-                batched=True,
-                with_indices=True,
-                num_proc=self.dataset_num_proc,
-                writer_batch_size=10,
-                desc="Tokenizing train dataset",
-            )
-            if eval_dataset is not None:
-                eval_dataset = eval_dataset.map(
-                    _tokenize,
-                    fn_kwargs=fn_kwargs,
-                    batched=True,
-                    with_indices=True,
-                    num_proc=self.dataset_num_proc,
-                    writer_batch_size=10,
-                    desc="Tokenizing eval dataset",
-                )
+        #     # tokenize the dataset, lower writer batch size to avoid OOM (frequent in vision models)
+        #     fn_kwargs = {
+        #         "tokenizer": self.processing_class,
+        #         "args": args,
+        #         "processor": self.processor if self.is_vision_model else None,
+        #         "model": model if self.is_encoder_decoder else None,
+        #     }
+        #     train_dataset = train_dataset.map(
+        #         _tokenize,
+        #         fn_kwargs=fn_kwargs,
+        #         batched=True,
+        #         with_indices=True,
+        #         num_proc=self.dataset_num_proc,
+        #         writer_batch_size=10,
+        #         desc="Tokenizing train dataset",
+        #     )
+        #     if eval_dataset is not None:
+        #         eval_dataset = eval_dataset.map(
+        #             _tokenize,
+        #             fn_kwargs=fn_kwargs,
+        #             batched=True,
+        #             with_indices=True,
+        #             num_proc=self.dataset_num_proc,
+        #             writer_batch_size=10,
+        #             desc="Tokenizing eval dataset",
+        #         )
 
         super().__init__(
             model=model,
@@ -1076,10 +1076,11 @@ class DPOTrainer(Trainer):
                 "num_workers": self.args.dataloader_num_workers,
                 "pin_memory": self.args.dataloader_pin_memory,
             }
+            lengths = [len(row["input_ids"]) for row in self.train_dataset["model_inputs"]]
             sampler = MultipackBatchSampler(
                 sampler=RandomSampler(self.train_dataset),
                 batch_size=self.args.per_device_train_batch_size,
-                lengths=np.array(self.train_dataset["length"]),
+                lengths=np.array(lengths),
                 batch_max_len=self.args.packing_length,
             )
             dataloader_params["batch_sampler"] = sampler
@@ -1147,10 +1148,11 @@ class DPOTrainer(Trainer):
                 "num_workers": self.args.dataloader_num_workers,
                 "pin_memory": self.args.dataloader_pin_memory,
             }
+            lengths = [len(row["model_inputs"]["input_ids"]) for row in self.eval_dataset["model_inputs"]]
             sampler = MultipackBatchSampler(
-                sampler=RandomSampler(self.eval_dataset),
-                batch_size=self.args.per_device_eval_batch_size,
-                lengths=np.array(self.eval_dataset["length"]),
+                sampler=RandomSampler(self.train_dataset),
+                batch_size=self.args.per_device_train_batch_size,
+                lengths=np.array(lengths),
                 batch_max_len=self.args.packing_length,
             )
             dataloader_params["batch_sampler"] = sampler
@@ -1564,55 +1566,55 @@ class DPOTrainer(Trainer):
         batch: Dict[str, Union[List, torch.LongTensor]],
         mode: Literal["train", "eval", "ref", "other"] = "ref", # the mode for training. Helpful for logging decisions
     ):
-        seq_len = batch["input_ids"].shape[-1]
+        model_inputs = batch["model_inputs"]
+        loss_inputs = batch["loss_inputs"]
+
+        seq_len = model_inputs["input_ids"].shape[-1]
         assert (
-            batch["position_ids"].shape[-1] == seq_len
-        ), f"position ids array is invalid, expected seq len {seq_len} but got array {batch['position_ids'].shape[-1]}"
+            model_inputs["position_ids"].shape[-1] == seq_len
+        ), f"position ids array is invalid, expected seq len {seq_len} but got array {model_inputs['position_ids'].shape[-1]}"
         inputs_device = self.accelerator.device
+
+        for k, val in model_inputs.items():
+            val.to(inputs_device)
+        for k, val in loss_inputs.items():
+            val.to(inputs_device)
 
         with CudaTimer(device=self.accelerator.device) as fwd_timer:
             if self.args.prefix_sharing:
                 if self.args.enable_packing:
-                    dpo_mask = construct_dpo_mask_with_packing(
-                        batch["sequence_id"].to(inputs_device).flatten(),
-                        batch["chosen_index"].to(inputs_device).flatten(),
-                        batch["rejected_index"].to(inputs_device).flatten(),
-                        batch["end_index"].to(inputs_device).flatten(),
-                        batch["input_ids"].shape[0],
-                        seq_len,
-                        index_seq_len=batch["chosen_index"].shape[-1],
+                    dpo_mask = construct_flex_mask(
+                        [get_causal_mask(), get_tree_mask(model_inputs["preorder_index"], model_inputs["postorder_index"]), get_packing_mask(model_inputs["document_id"])],
+                        seq_len=seq_len,
                     )
                 else:
-                    dpo_mask = construct_dpo_mask(
-                        batch["chosen_index"].to(inputs_device),
-                        batch["rejected_index"].to(inputs_device),
-                        seq_len,
-                    )
+                    raise NotImplementedError
                 outputs = model(
-                    batch["input_ids"].to(inputs_device),
-                    position_ids=batch["position_ids"].to(inputs_device),
+                    model_inputs["input_ids"],
+                    position_ids=model_inputs["position_ids"],
                     attention_mask=dpo_mask,
                     use_cache=False,
                 )
             else:
-                # attention mask should be (b, h, q, kv) I think?
-                q_idx = torch.arange(seq_len)[None, None, :, None].to(inputs_device)
-                kv_idx = torch.arange(seq_len)[None, None, None, :].to(inputs_device)
-                mask = (
-                    ~(
-                        (q_idx >= batch["rejected_index"][:, None, None, None])
-                        & (batch["chosen_index"][:, None, None, None] <= kv_idx)
-                        & (kv_idx < batch["rejected_index"][:, None, None, None])
-                    )
-                ) & (q_idx >= kv_idx)
-                bias_mask = torch.zeros(mask.shape, dtype=torch.bfloat16, device=inputs_device)
-                bias_mask[~mask] = -torch.inf
-                outputs = model(
-                    batch["input_ids"].to(inputs_device),
-                    position_ids=batch["position_ids"].to(inputs_device),
-                    attention_mask=bias_mask,
-                    use_cache=False,
-                )
+                raise NotImplementedError
+                # # attention mask should be (b, h, q, kv) I think?
+                # q_idx = torch.arange(seq_len)[None, None, :, None].to(inputs_device)
+                # kv_idx = torch.arange(seq_len)[None, None, None, :].to(inputs_device)
+                # mask = (
+                #     ~(
+                #         (q_idx >= batch["rejected_index"][:, None, None, None])
+                #         & (batch["chosen_index"][:, None, None, None] <= kv_idx)
+                #         & (kv_idx < batch["rejected_index"][:, None, None, None])
+                #     )
+                # ) & (q_idx >= kv_idx)
+                # bias_mask = torch.zeros(mask.shape, dtype=torch.bfloat16, device=inputs_device)
+                # bias_mask[~mask] = -torch.inf
+                # outputs = model(
+                #     batch["input_ids"].to(inputs_device),
+                #     position_ids=batch["position_ids"].to(inputs_device),
+                #     attention_mask=bias_mask,
+                #     use_cache=False,
+                # )
         fwd_time = fwd_timer.elapsed_time
         # log only for training
         if mode in ["train", "ref"]:
@@ -1621,15 +1623,71 @@ class DPOTrainer(Trainer):
             super().log({f"{mode}_fwd_time": fwd_time / 1e3})
 
         all_logits = outputs.logits
+        loss_fct = nn.CrossEntropyLoss(ignore_index=self.label_pad_token_id, reduction="none")
+
+        all_logps_tokens = -loss_fct(all_logits.permute(0, 2, 1).float(), model_inputs["labels"])
+
+        # print(mode)
+        # print(loss_inputs["parent_index"])
+        # print(loss_inputs["parent_rollout_index"])
+        # print(loss_inputs["num_correct"])
+        # print(loss_inputs["num_rollouts"])
         with CudaTimer(device=self.accelerator.device) as logps_timer:
-            logps_chosen, logps_rejected = self.get_batch_logps_prefix_sharing(
-                all_logits,
-                batch["labels"].to(inputs_device),
-                chosen_indexes=batch["chosen_index"].to(inputs_device),
-                rejected_indexes=batch["rejected_index"].to(inputs_device),
-                loss_seq_id=batch["loss_seq_id"].to(inputs_device) if "loss_seq_id" in batch else None,
-            )
+            sequence_id = model_inputs["sequence_id"]
+            offset_per_batch = torch.cumsum(torch.amax(sequence_id, dim=-1, keepdim=True) + 1, dim=0)
+            sequence_id[1:] += offset_per_batch[:-1]
+
+            sequence_id = sequence_id + 1 # shift everything up by one to include padding value at 0
+            all_logps = torch.zeros(torch.amax(sequence_id) + 1, dtype=all_logps_tokens.dtype, device=all_logps_tokens.device)
+            assert sequence_id.shape == all_logps_tokens.shape
+            assert torch.min(sequence_id) >= 0
+            all_logps.scatter_add_(0, sequence_id.flatten(), all_logps_tokens.flatten())
+            all_logps = all_logps[1:]
+
+            loss_inputs["parent_rollout_index"][loss_inputs["parent_rollout_index"] >= 2] = -20000
+            final_indexes = loss_inputs["parent_index"].flatten() * 2 + loss_inputs["parent_rollout_index"].flatten()
+            final_indexes = final_indexes + 1 # shift everything up by one to include padding value at 0
+            final_indexes[final_indexes < 0] = 0 # these are all the padding/invalid indices
+
+            all_logps_paired = torch.zeros((torch.amax(loss_inputs["parent_index"]) + 1) * 2 + 1, dtype=all_logps.dtype, device=all_logps.device)
+            # print(all_logps_paired.shape)
+            # if self.accelerator.device.index == 0:
+            #     breakpoint()
+            # self.accelerator.wait_for_everyone()
+            all_logps_paired.scatter_(0, final_indexes, all_logps) # gather and remove the padding
+            all_logps_paired = all_logps_paired[1:]
+            all_logps_paired = all_logps_paired.reshape(-1, 2)
+
+            scores = loss_inputs["num_correct"] / loss_inputs["num_rollouts"]
+            scores_paired = torch.full(((torch.amax(loss_inputs["parent_index"]) + 1) * 2 + 1,), fill_value=-1, dtype=scores.dtype, device=scores.device)
+            scores_paired.scatter_(0, final_indexes, scores)
+            scores_paired = scores_paired[1:]
+            scores_paired = scores_paired.reshape(-1, 2)
+            # print(scores_paired)
+
+            useful_indices = (torch.abs(scores_paired[:, 0] - scores_paired[:, 1]) > 0.01) & (scores_paired[:, 0] != -1) & (scores_paired[:, 1] != -1) 
+            all_logps_paired = all_logps_paired[useful_indices]
+            scores_paired = scores_paired[useful_indices]
+
+            # print()
+            # print(mode)
+            # print(scores_paired)
+            logps_chosen = torch.where(scores_paired[:, 0] > scores_paired[:, 1], all_logps_paired[:, 0], all_logps_paired[:, 1])
+            logps_rejected = torch.where(scores_paired[:, 0] < scores_paired[:, 1], all_logps_paired[:, 0], all_logps_paired[:, 1])
+            if logps_rejected.shape != logps_chosen.shape:
+                if self.accelerator.is_main_process:
+                    breakpoint()
+                self.accelerator.wait_for_everyone()
+
+            # logps_chosen, logps_rejected = self.get_batch_logps_prefix_sharing(
+            #     all_logits,
+            #     batch["labels"].to(inputs_device),
+            #     chosen_indexes=batch["chosen_index"].to(inputs_device),
+            #     rejected_indexes=batch["rejected_index"].to(inputs_device),
+            #     loss_seq_id=batch["loss_seq_id"].to(inputs_device) if "loss_seq_id" in batch else None,
+            # )
         logps_time = logps_timer.elapsed_time
+
         if mode == "train":
             # don't use dpoTrainer's .log because it is shit
             super().log({f"{mode}_logps_time": logps_time / 1e3})
@@ -1786,7 +1844,10 @@ class DPOTrainer(Trainer):
                     reference_chosen_logps, reference_rejected_logps = forward_func(
                         self.ref_model, batch
                     )[:2]
-        
+        if reference_chosen_logps.shape != policy_chosen_logps.shape:
+            if self.accelerator.is_main_process:
+                breakpoint()
+            self.accelerator.wait_for_everyone()
         losses, chosen_rewards, rejected_rewards = self.dpo_loss(
             policy_chosen_logps,
             policy_rejected_logps,

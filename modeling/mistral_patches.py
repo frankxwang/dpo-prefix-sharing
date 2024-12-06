@@ -9,7 +9,6 @@ from transformers.models.mistral.modeling_mistral import (
     MistralModel,
     MISTRAL_ATTENTION_CLASSES,
     apply_rotary_pos_emb,
-    repeat_kv
 )
 
 class MistralFlexAttention(MistralAttention):

@@ -1,17 +1,16 @@
-dataset="argilla/distilabel-capybara-dpo-7k-binarized" 
-model="meta-llama/Meta-Llama-3.1-8B-Instruct"
-max_length=2842
-max_prompt_length=2180
-packing_length=3968
-batch_size=2
-output_dir="capybara_packing"
+dataset="fxwang/easy-math-trees_v2-round-2" 
+model="round-1-model"
+max_length=16384
+packing_length=16384
+batch_size=1
+output_dir="gsm8k_packing-llama-3p2-1B-v2"
 
 accelerate launch --config_file 'configs/zero3.yaml' train_dpo.py \
   --dataset_name=$dataset \
   --model_name_or_path=$model \
   --per_device_train_batch_size 1 \
   --per_device_eval_batch_size 1 \
-  --beta 0.1 \
+  --beta 0.3 \
   --learning_rate 1e-6 \
   --gradient_accumulation_steps 1 \
   --logging_steps 10 \
@@ -20,9 +19,8 @@ accelerate launch --config_file 'configs/zero3.yaml' train_dpo.py \
   --logging_first_step \
   --no_remove_unused_columns \
   --output_dir $output_dir \
-  --max_prompt_length $max_prompt_length \
   --max_length $max_length \
-  --gradient_checkpointing False \
+  --gradient_checkpointing True \
   --save_strategy no \
   --dataset_train_split train \
   --num_train_epochs 1 \
